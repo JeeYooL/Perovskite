@@ -1,192 +1,275 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
+import re
+
+from sklearn.model_selection import train_test_split, KFold, GridSearchCV, cross_val_score
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import r2_score, mean_squared_error
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import r2_score, mean_absolute_error
 
-# --- [1] 페이지 설정 ---
-st.set_page_config(page_title="SolarCell ML Optimizer", layout="wide", page_icon="🤖")
+# -------------------------------------------------------------------
+# 페이지 설정
+# -------------------------------------------------------------------
+st.set_page_config(
+    page_title="Perovskite ML Optimizer V2.0",
+    page_icon="⚗️",
+    layout="wide"
+)
 
-st.title("🤖 Solar Cell ML Optimizer")
+# 스타일 커스텀
 st.markdown("""
-이 앱은 **실험 데이터(CSV)**를 기반으로 머신러닝 모델을 학습시켜, 
-공정 변수와 소자 효율(PCE) 간의 상관관계를 분석하고 최적의 조건을 탐색합니다.
-""")
+    <style>
+    .main {
+        background-color: #f8f9fa;
+    }
+    h1 {
+        color: #2c3e50;
+    }
+    .stButton>button {
+        width: 100%;
+        background-color: #4CAF50;
+        color: white;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-# --- [2] 사이드바: 데이터 업로드 ---
-st.sidebar.header("1. Data Upload")
-uploaded_file = st.sidebar.file_uploader("ML용 CSV 파일 업로드", type=["csv", "xlsx"])
+# -------------------------------------------------------------------
+# 함수 정의
+# -------------------------------------------------------------------
 
-# --- [3] 메인 로직 ---
-if uploaded_file:
-    # 데이터 로드
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-        
-        st.success(f"데이터 로드 성공! 총 {len(df)}개의 샘플이 있습니다.")
-        
-        # 데이터 미리보기 (접기 가능)
-        with st.expander("데이터 미리보기 (상위 5행)", expanded=False):
-            st.dataframe(df.head(), use_container_width=True)
+def load_data(uploaded_files):
+    """업로드된 파일들을 하나의 데이터프레임으로 병합"""
+    all_dfs = []
+    for uploaded_file in uploaded_files:
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+                all_dfs.append(df)
+            elif uploaded_file.name.endswith('.xlsx'):
+                df = pd.read_excel(uploaded_file)
+                all_dfs.append(df)
+        except Exception as e:
+            st.error(f"파일 로드 중 오류 발생 ({uploaded_file.name}): {e}")
+    
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    return None
 
-        # --- [4] 데이터 전처리 ---
-        st.subheader("2. Data Preprocessing & Modeling")
-        
-        # 1. 타겟 변수 선택 (PCE)
-        target_col = st.selectbox("타겟 변수 (예측 목표) 선택", df.columns, index=df.columns.get_loc("PCE (%)") if "PCE (%)" in df.columns else 0)
-        
-        # 2. 입력 변수(Feature) 선택
-        # 기본적으로 숫자형 컬럼이나 특정 패턴이 있는 컬럼을 추천할 수 있지만, 여기선 전체 컬럼 중 선택하게 함
-        # 불필요한 컬럼 (Sample, File 등 식별자) 제외
-        exclude_cols = ['Sample', 'File', 'Scan Direction', target_col]
-        feature_candidates = [c for c in df.columns if c not in exclude_cols]
-        
-        # 기본 선택 변수 추천 (HTL, Perovskite 관련)
-        default_features = [c for c in feature_candidates if c.startswith('HTL') or c.startswith('Perovskite') or c.startswith('TCO') or c.startswith('ETL')][:5]
-        selected_features = st.multiselect("학습에 사용할 변수(Feature) 선택", feature_candidates, default=default_features)
-        
-        if not selected_features:
-            st.warning("최소 1개 이상의 변수를 선택해주세요.")
-            st.stop()
+def preprocess_data(df):
+    """데이터 전처리: 결측치 제거, 타겟 분리, MLB(Multi-Label Binarization)"""
+    target_column = 'PCE (%)'
+    
+    # 타겟 값이 없는 행 제거
+    if target_column not in df.columns:
+        st.error(f"데이터에 '{target_column}' 컬럼이 없습니다.")
+        return None, None, None, None
 
-        # 3. 모델 학습 버튼
-        if st.button("🚀 Run Machine Learning (Random Forest)"):
-            
-            # --- 데이터 준비 ---
-            X = df[selected_features].copy()
-            y = df[target_col].copy()
-            
-            # 결측치 처리 (숫자형: 평균, 범주형: 최빈값)
-            num_cols = X.select_dtypes(include=np.number).columns
-            cat_cols = X.select_dtypes(exclude=np.number).columns
-            
-            # 숫자형 Imputer
-            if len(num_cols) > 0:
-                imputer_num = SimpleImputer(strategy='mean')
-                X[num_cols] = imputer_num.fit_transform(X[num_cols])
-            
-            # 범주형 인코딩 (Label Encoding)
-            label_encoders = {}
-            if len(cat_cols) > 0:
-                for col in cat_cols:
-                    le = LabelEncoder()
-                    # 결측치는 'Missing'으로 채움
-                    X[col] = X[col].fillna('Missing').astype(str)
-                    X[col] = le.fit_transform(X[col])
-                    label_encoders[col] = le
-            
-            # 타겟 결측치 제거
-            valid_idx = y.notna()
-            X = X[valid_idx]
-            y = y[valid_idx]
-            
-            if len(X) < 10:
-                st.error("유효한 데이터가 너무 적습니다 (10개 미만). 더 많은 데이터를 확보하거나 전처리 방식을 확인하세요.")
-                st.stop()
+    df_cleaned = df.dropna(subset=[target_column]).copy()
+    
+    # Data Leakage 방지를 위한 결과값 컬럼 제외
+    drop_cols = [
+        'PCE (%)', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)',
+        'Sample', 'File', 'Scan Direction', 'Unnamed: 0'
+    ]
+    # 실제 데이터셋에 존재하는 컬럼만 drop
+    cols_to_drop = [c for c in drop_cols if c in df_cleaned.columns]
+    
+    X_raw = df_cleaned.drop(columns=cols_to_drop, errors='ignore')
+    y = df_cleaned[target_column]
+    
+    # 문자열/수치형 분리
+    X_numeric = X_raw.select_dtypes(exclude=['object'])
+    X_categorical = X_raw.select_dtypes(include=['object'])
+    
+    # 범주형 데이터 처리 (MLB 방식: 'A + B' -> A, B 각각 1)
+    all_processed_dfs = [X_numeric]
+    
+    # 전처리 과정 로그용
+    processed_cols_log = []
 
-            # Train/Test Split
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-            
-            # 모델 학습
-            rf = RandomForestRegressor(n_estimators=100, random_state=42)
-            rf.fit(X_train, y_train)
-            y_pred = rf.predict(X_test)
-            
-            # --- 결과 분석 ---
-            r2 = r2_score(y_test, y_pred)
-            mse = mean_squared_error(y_test, y_pred)
-            
-            st.markdown("---")
-            st.subheader("3. Analysis Results")
-            
-            # 성능 지표
-            col1, col2 = st.columns(2)
-            col1.metric("Model R² Score", f"{r2:.3f}", help="1에 가까울수록 모델이 데이터를 잘 설명합니다.")
-            col2.metric("Mean Squared Error (MSE)", f"{mse:.3f}")
-            
-            # 1. Feature Importance Plot
-            st.markdown("#### 🌟 Feature Importance (중요 변수 순위)")
-            importances = rf.feature_importances_
-            feature_imp_df = pd.DataFrame({'Feature': selected_features, 'Importance': importances}).sort_values('Importance', ascending=True)
-            
-            fig_imp = px.bar(feature_imp_df, x='Importance', y='Feature', orientation='h', title="Top Influential Factors on PCE")
-            st.plotly_chart(fig_imp, use_container_width=True)
-            
-            # 2. Actual vs Predicted Plot
-            st.markdown("#### 🎯 Prediction Accuracy (실제값 vs 예측값)")
-            fig_pred = px.scatter(x=y_test, y=y_pred, labels={'x': 'Actual PCE', 'y': 'Predicted PCE'}, title="Actual vs Predicted")
-            # 기준선 (y=x) 추가
-            fig_pred.add_shape(type="line", line=dict(dash='dash', color='gray'), x0=y.min(), y0=y.max(), x1=y.min(), y1=y.max())
-            st.plotly_chart(fig_pred, use_container_width=True)
-            
-            # 3. Correlation Scatter Plot (Top Feature)
-            if not feature_imp_df.empty:
-                top_feature = feature_imp_df.iloc[-1]['Feature']
-                st.markdown(f"#### 🔍 Top Factor Analysis: {top_feature} vs {target_col}")
+    for col in X_categorical.columns:
+        # 결측치는 빈 문자열로 처리 후 분리
+        binarized = X_categorical[col].fillna('').astype(str).str.get_dummies(sep=' + ')
+        
+        # 컬럼명에 원래 변수명 접두사 추가 (예: Solvent_DMF)
+        binarized = binarized.add_prefix(f"{col}_")
+        
+        # 특수문자 정제 (컬럼명 깨짐 방지)
+        binarized.columns = binarized.columns.str.replace(r'[^\w\s]', '_', regex=True).str.replace(r'\s+', '_', regex=True)
+        
+        all_processed_dfs.append(binarized)
+        processed_cols_log.append(col)
+        
+    X_processed = pd.concat(all_processed_dfs, axis=1).fillna(0)
+    
+    return X_processed, y, df_cleaned, X_raw
+
+# -------------------------------------------------------------------
+# UI 구성
+# -------------------------------------------------------------------
+
+st.title("⚗️ Perovskite 공정 최적화 및 성능 예측 AI (V2.0)")
+st.markdown("---")
+
+# 사이드바: 데이터 업로드 및 설정
+with st.sidebar:
+    st.header("1. 데이터 업로드")
+    uploaded_files = st.file_uploader(
+        "CSV 또는 Excel 파일을 업로드하세요 (여러 개 가능)", 
+        type=['csv', 'xlsx'], 
+        accept_multiple_files=True
+    )
+    
+    st.markdown("---")
+    st.header("2. 모델 설정")
+    test_size = st.slider("테스트 데이터 비율", 0.1, 0.4, 0.2, 0.05)
+    cv_folds = st.slider("교차 검증 (K-Fold) 횟수", 2, 10, 5)
+    
+    st.markdown("---")
+    st.info("💡 **Tip**: 'A + B' 형태의 텍스트 데이터는 자동으로 분리되어 학습됩니다.")
+
+if uploaded_files:
+    # 1. 데이터 로드
+    raw_df = load_data(uploaded_files)
+    
+    if raw_df is not None:
+        st.write(f"✅ 총 **{len(raw_df)}**개의 샘플이 로드되었습니다.")
+        
+        # 데이터 미리보기
+        with st.expander("원본 데이터 미리보기"):
+            st.dataframe(raw_df.head())
+
+        # 2. 전처리 및 학습 버튼
+        if st.button("🚀 AI 모델 학습 및 최적화 시작"):
+            with st.spinner('데이터 전처리 및 모델 최적화 중입니다... (시간이 소요될 수 있습니다)'):
                 
-                # 원본 데이터(df)를 사용하여 시각화 (인코딩 전 값 사용)
-                fig_scatter = px.scatter(df, x=top_feature, y=target_col, color=target_col, title=f"Correlation: {top_feature} vs {target_col}")
-                st.plotly_chart(fig_scatter, use_container_width=True)
-
-            # --- [5] 최적화 시뮬레이터 (Optional) ---
-            st.markdown("---")
-            st.subheader("🧪 Virtual Experiment (Simulator)")
-            st.info("아래 변수들을 조절하여 예상 PCE를 예측해보세요.")
-            
-            input_data = {}
-            
-            # 입력 폼 생성 (3단 컬럼)
-            cols = st.columns(3)
-            
-            for i, col_name in enumerate(selected_features):
-                col_obj = cols[i % 3]
+                # 전처리 실행
+                X, y, df_clean, X_raw_origin = preprocess_data(raw_df)
                 
-                # 범주형인 경우
-                if col_name in cat_cols:
-                    # 원본 데이터의 unique 값들 가져오기 (라벨 인코더의 클래스 정보 활용)
-                    if col_name in label_encoders:
-                        options = list(label_encoders[col_name].classes_)
-                        val = col_obj.selectbox(f"{col_name}", options)
-                        # 인코딩해서 저장
-                        input_data[col_name] = label_encoders[col_name].transform([val])[0]
-                    else:
-                        st.warning(f"인코더 정보 없음: {col_name}")
-                
-                # 숫자형인 경우
-                else:
-                    min_val = float(df[col_name].min())
-                    max_val = float(df[col_name].max())
-                    mean_val = float(df[col_name].mean())
+                if X is not None:
+                    st.success(f"전처리 완료! 학습에 사용될 피처 수: **{X.shape[1]}개**")
                     
-                    # 범위가 0이면 슬라이더 오류 방지를 위해 약간 조정
-                    if min_val == max_val:
-                        min_val -= 0.1
-                        max_val += 0.1
+                    # 3. 데이터 분할
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y, test_size=test_size, random_state=42
+                    )
+                    
+                    # 4. GridSearchCV (하이퍼파라미터 튜닝)
+                    param_grid = {
+                        'n_estimators': [100, 200, 300],
+                        'max_depth': [None, 10, 20],
+                        'min_samples_split': [2, 5]
+                    }
+                    
+                    rf = RandomForestRegressor(random_state=42, n_jobs=-1)
+                    grid_search = GridSearchCV(
+                        rf, 
+                        param_grid, 
+                        cv=cv_folds, 
+                        scoring='neg_mean_absolute_error',
+                        verbose=0
+                    )
+                    
+                    grid_search.fit(X_train, y_train)
+                    best_model = grid_search.best_estimator_
+                    
+                    st.markdown("---")
+                    
+                    # 5. 결과 리포트 섹션 (2단 레이아웃)
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader("📊 모델 성능 평가")
                         
-                    val = col_obj.slider(f"{col_name}", min_val, max_val, mean_val)
-                    input_data[col_name] = val
-            
-            if st.button("Predict PCE for these conditions"):
-                # 입력 데이터를 DataFrame으로 변환 (컬럼 순서 맞춤)
-                input_df = pd.DataFrame([input_data])
-                
-                # 모델 예측
-                try:
-                    pred_pce = rf.predict(input_df)[0]
-                    st.success(f"🧪 예측된 PCE: **{pred_pce:.2f}%**")
-                except Exception as e:
-                    st.error(f"예측 중 오류 발생: {e}")
+                        # 교차 검증 점수
+                        cv_scores = cross_val_score(best_model, X, y, cv=cv_folds, scoring='r2')
+                        st.metric("5-Fold CV 평균 R²", f"{cv_scores.mean():.4f}")
+                        
+                        # 테스트 셋 점수
+                        y_pred = best_model.predict(X_test)
+                        r2 = r2_score(y_test, y_pred)
+                        mae = mean_absolute_error(y_test, y_pred)
+                        
+                        st.write(f"**테스트 세트 R²:** {r2:.4f}")
+                        st.write(f"**평균 오차 (MAE):** {mae:.4f} %PCE")
+                        st.caption(f"최적 파라미터: {grid_search.best_params_}")
+                        
+                        # 실제값 vs 예측값 그래프
+                        fig, ax = plt.subplots(figsize=(6, 5))
+                        ax.scatter(y_test, y_pred, alpha=0.6, edgecolors='w', color='#2980b9')
+                        ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
+                        ax.set_xlabel("Actual PCE (%)")
+                        ax.set_ylabel("Predicted PCE (%)")
+                        ax.set_title("Actual vs Predicted")
+                        ax.grid(True, alpha=0.3)
+                        st.pyplot(fig)
 
-    except Exception as e:
-        st.error(f"파일 처리 중 오류가 발생했습니다: {e}")
+                    with col2:
+                        st.subheader("🔑 중요 공정 변수 (Top 20)")
+                        
+                        # 중요도 추출
+                        importances = best_model.feature_importances_
+                        feat_imp_df = pd.DataFrame({'Feature': X.columns, 'Importance': importances})
+                        feat_imp_df = feat_imp_df.sort_values(by='Importance', ascending=False).head(20)
+                        
+                        # 중요도 그래프
+                        fig2, ax2 = plt.subplots(figsize=(6, 8))
+                        sns.barplot(x='Importance', y='Feature', data=feat_imp_df, palette='viridis', ax=ax2)
+                        ax2.set_title("Feature Importance")
+                        st.pyplot(fig2)
+
+                    st.markdown("---")
+                    
+                    # 6. 실험 방향 제안
+                    st.header("💡 AI 기반 실험 제안")
+                    st.write("현재 데이터셋 내 **최고 효율 장치**의 레시피와 **중요 변수**를 기반으로 분석한 결과입니다.")
+                    
+                    best_idx = y.idxmax()
+                    best_val = y.max()
+                    
+                    st.success(f"🏆 현재 최고 효율: **{best_val:.2f}%** (Sample ID: {best_idx})")
+                    
+                    # 최고 효율 레시피 추출
+                    best_recipe = df_clean.loc[best_idx]
+                    
+                    # 중요 변수 상위 5개에 대한 제안 생성
+                    suggestions = []
+                    for feat in feat_imp_df['Feature'].head(5):
+                        # 원본 컬럼 찾기 (MLB 전의 이름 추적)
+                        # 예: Solvent_DMF -> Solvent
+                        original_col = next((c for c in X_raw_origin.columns if feat.startswith(c)), None)
+                        
+                        if original_col:
+                            val = best_recipe.get(original_col, "N/A")
+                            suggestions.append({
+                                "중요 변수 (Feature)": feat,
+                                "원인 변수": original_col,
+                                "최고 효율 조건 값": val,
+                                "제안": "이 변수는 성능에 매우 중요합니다. 위 값을 중심으로 미세 조정(Fine-tuning) 하세요."
+                            })
+                        else:
+                            # 수치형 변수일 경우
+                            val = best_recipe.get(feat, "N/A")
+                            suggestions.append({
+                                "중요 변수 (Feature)": feat,
+                                "원인 변수": feat,
+                                "최고 효율 조건 값": val,
+                                "제안": "수치형 중요 변수입니다. 이 값 주변으로 범위를 좁혀 최적화하세요."
+                            })
+                    
+                    st.table(pd.DataFrame(suggestions))
 
 else:
-    st.info("👈 왼쪽 사이드바에서 데이터 파일을 업로드해주세요.")
+    st.info("왼쪽 사이드바에서 데이터 파일을 업로드해주세요.")
+    st.markdown("""
+    ### 👋 환영합니다!
+    이 앱은 페로브스카이트 태양전지 공정 데이터를 분석하여 최적의 레시피를 제안합니다.
+    
+    **데이터 파일 형식:**
+    - `.csv` 또는 `.xlsx`
+    - 필수 컬럼: `PCE (%)`
+    - 그 외 공정 변수들 (예: `Temp`, `Solvent`, `Additive` 등)
+    """)
