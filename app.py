@@ -6,33 +6,27 @@ import seaborn as sns
 import io
 import re
 
+# 머신러닝 & 설명 가능한 AI(XAI) 관련 라이브러리
 from sklearn.model_selection import train_test_split, KFold, GridSearchCV, cross_val_score
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import r2_score, mean_absolute_error
+import xgboost as xgb
+import shap
 
 # -------------------------------------------------------------------
 # 페이지 설정
 # -------------------------------------------------------------------
 st.set_page_config(
-    page_title="Perovskite ML Optimizer V2.0",
-    page_icon="⚗️",
+    page_title="Perovskite AI Lab (XGBoost + SHAP)",
+    page_icon="🧪",
     layout="wide"
 )
 
-# 스타일 커스텀
+# 스타일 커스텀 (논문 스타일의 깔끔한 디자인)
 st.markdown("""
     <style>
-    .main {
-        background-color: #f8f9fa;
-    }
-    h1 {
-        color: #2c3e50;
-    }
-    .stButton>button {
-        width: 100%;
-        background-color: #4CAF50;
-        color: white;
-    }
+    .main { background-color: #ffffff; }
+    h1, h2, h3 { color: #003366; font-family: 'Arial', sans-serif; }
+    .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 5px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -62,111 +56,89 @@ def preprocess_data(df):
     """데이터 전처리: 결측치 제거, 타겟 분리, MLB(Multi-Label Binarization)"""
     target_column = 'PCE (%)'
     
-    # 타겟 값이 없는 행 제거
     if target_column not in df.columns:
         st.error(f"데이터에 '{target_column}' 컬럼이 없습니다.")
         return None, None, None, None
 
     df_cleaned = df.dropna(subset=[target_column]).copy()
     
-    # Data Leakage 방지를 위한 결과값 컬럼 제외
+    # Data Leakage 방지: 결과값 컬럼 제외
     drop_cols = [
         'PCE (%)', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)',
         'Sample', 'File', 'Scan Direction', 'Unnamed: 0'
     ]
-    # 실제 데이터셋에 존재하는 컬럼만 drop
     cols_to_drop = [c for c in drop_cols if c in df_cleaned.columns]
     
     X_raw = df_cleaned.drop(columns=cols_to_drop, errors='ignore')
     y = df_cleaned[target_column]
     
-    # 문자열/수치형 분리
+    # 수치형/범주형 분리
     X_numeric = X_raw.select_dtypes(exclude=['object'])
     X_categorical = X_raw.select_dtypes(include=['object'])
     
-    # 범주형 데이터 처리 (MLB 방식: 'A + B' -> A, B 각각 1)
     all_processed_dfs = [X_numeric]
-    
-    # 전처리 과정 로그용
-    processed_cols_log = []
 
     for col in X_categorical.columns:
-        # 결측치는 빈 문자열로 처리 후 분리
+        # 'FAI + MACl' 같은 복합 조성을 개별 성분으로 분리 (One-Hot Encoding 확장)
         binarized = X_categorical[col].fillna('').astype(str).str.get_dummies(sep=' + ')
-        
-        # 컬럼명에 원래 변수명 접두사 추가 (예: Solvent_DMF)
         binarized = binarized.add_prefix(f"{col}_")
-        
-        # 특수문자 정제 (컬럼명 깨짐 방지)
         binarized.columns = binarized.columns.str.replace(r'[^\w\s]', '_', regex=True).str.replace(r'\s+', '_', regex=True)
-        
         all_processed_dfs.append(binarized)
-        processed_cols_log.append(col)
         
     X_processed = pd.concat(all_processed_dfs, axis=1).fillna(0)
     
     return X_processed, y, df_cleaned, X_raw
 
 # -------------------------------------------------------------------
-# UI 구성
+# 메인 UI
 # -------------------------------------------------------------------
 
-st.title("⚗️ Perovskite 공정 최적화 및 성능 예측 AI (V2.0)")
+st.title("🧪 Perovskite AI Lab: XGBoost & SHAP Analysis")
+st.markdown("""
+최신 연구 트렌드(Science, Nature Energy 등)를 반영하여 **XGBoost(고성능 부스팅)** 모델과 **SHAP(설명 가능한 AI)** 기법을 적용했습니다.
+""")
 st.markdown("---")
 
-# 사이드바: 데이터 업로드 및 설정
+# 사이드바
 with st.sidebar:
-    st.header("1. 데이터 업로드")
-    uploaded_files = st.file_uploader(
-        "CSV 또는 Excel 파일을 업로드하세요 (여러 개 가능)", 
-        type=['csv', 'xlsx'], 
-        accept_multiple_files=True
-    )
+    st.header("1. Data Upload")
+    uploaded_files = st.file_uploader("Upload CSV/Excel", type=['csv', 'xlsx'], accept_multiple_files=True)
+    
+    st.header("2. Model Settings")
+    test_size = st.slider("Test Set Ratio", 0.1, 0.4, 0.2, 0.05)
+    cv_folds = st.slider("CV Folds", 2, 10, 5)
     
     st.markdown("---")
-    st.header("2. 모델 설정")
-    test_size = st.slider("테스트 데이터 비율", 0.1, 0.4, 0.2, 0.05)
-    cv_folds = st.slider("교차 검증 (K-Fold) 횟수", 2, 10, 5)
-    
-    st.markdown("---")
-    st.info("💡 **Tip**: 'A + B' 형태의 텍스트 데이터는 자동으로 분리되어 학습됩니다.")
+    st.info("💡 **XGBoost**는 페로브스카이트 공정 데이터와 같은 정형 데이터(Tabular Data)에서 최고의 성능을 보입니다.")
 
 if uploaded_files:
-    # 1. 데이터 로드
     raw_df = load_data(uploaded_files)
     
     if raw_df is not None:
-        st.write(f"✅ 총 **{len(raw_df)}**개의 샘플이 로드되었습니다.")
+        st.write(f"✅ Loaded **{len(raw_df)}** samples.")
         
-        # 데이터 미리보기
-        with st.expander("원본 데이터 미리보기"):
-            st.dataframe(raw_df.head())
-
-        # 2. 전처리 및 학습 버튼
-        if st.button("🚀 AI 모델 학습 및 최적화 시작"):
-            with st.spinner('데이터 전처리 및 모델 최적화 중입니다... (시간이 소요될 수 있습니다)'):
+        if st.button("🚀 Run AI Analysis (Train & Explain)"):
+            with st.spinner('Preprocessing data & optimizing XGBoost model...'):
                 
-                # 전처리 실행
+                # 1. 전처리
                 X, y, df_clean, X_raw_origin = preprocess_data(raw_df)
                 
                 if X is not None:
-                    st.success(f"전처리 완료! 학습에 사용될 피처 수: **{X.shape[1]}개**")
+                    # 2. 데이터 분할
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
                     
-                    # 3. 데이터 분할
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X, y, test_size=test_size, random_state=42
-                    )
+                    # 3. XGBoost 모델 및 하이퍼파라미터 설정
+                    xgb_model = xgb.XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42)
                     
-                    # 4. GridSearchCV (하이퍼파라미터 튜닝)
                     param_grid = {
-                        'n_estimators': [100, 200, 300],
-                        'max_depth': [None, 10, 20],
-                        'min_samples_split': [2, 5]
+                        'n_estimators': [100, 300],
+                        'learning_rate': [0.05, 0.1],
+                        'max_depth': [3, 5, 7],
+                        'subsample': [0.8, 1.0]
                     }
                     
-                    rf = RandomForestRegressor(random_state=42, n_jobs=-1)
                     grid_search = GridSearchCV(
-                        rf, 
+                        xgb_model, 
                         param_grid, 
                         cv=cv_folds, 
                         scoring='neg_mean_absolute_error',
@@ -176,100 +148,99 @@ if uploaded_files:
                     grid_search.fit(X_train, y_train)
                     best_model = grid_search.best_estimator_
                     
+                    # ----------------------------------------------------------------
+                    # 결과 대시보드
+                    # ----------------------------------------------------------------
+                    
+                    # [Tab 1: 성능]
+                    st.subheader("1. Model Performance")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    y_pred = best_model.predict(X_test)
+                    r2 = r2_score(y_test, y_pred)
+                    mae = mean_absolute_error(y_test, y_pred)
+                    cv_r2 = cross_val_score(best_model, X, y, cv=cv_folds, scoring='r2').mean()
+                    
+                    col1.metric("Test R² Score", f"{r2:.4f}")
+                    col2.metric("Mean Absolute Error", f"{mae:.4f} %")
+                    col3.metric("Cross-Validation R²", f"{cv_r2:.4f}")
+                    
+                    # 예측 그래프
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    ax.scatter(y_test, y_pred, alpha=0.6, color='#2c3e50', edgecolors='w')
+                    ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
+                    ax.set_xlabel("Experimental PCE (%)")
+                    ax.set_ylabel("Predicted PCE (%)")
+                    ax.set_title("Prediction Accuracy")
+                    ax.grid(True, alpha=0.3)
+                    st.pyplot(fig)
+                    
+                    # [Tab 2: SHAP 분석 (XAI)]
                     st.markdown("---")
+                    st.subheader("2. Explainable AI (SHAP Analysis)")
+                    st.markdown("""
+                    **SHAP Summary Plot**은 각 공정 변수가 효율에 미치는 영향을 보여줍니다.
+                    * **점의 색상**: 변수의 값 (빨강=높음, 파랑=낮음)
+                    * **X축 위치**: 효율에 미치는 영향 (오른쪽=효율 증가, 왼쪽=효율 감소)
+                    * *예: 'Temperature'가 빨간색(고온)일 때 오른쪽(양의 값)에 있다면, 온도가 높을수록 효율이 좋다는 의미입니다.*
+                    """)
                     
-                    # 5. 결과 리포트 섹션 (2단 레이아웃)
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.subheader("📊 모델 성능 평가")
+                    with st.spinner("Calculating SHAP values..."):
+                        explainer = shap.Explainer(best_model, X_train)
+                        shap_values = explainer(X_test)
                         
-                        # 교차 검증 점수
-                        cv_scores = cross_val_score(best_model, X, y, cv=cv_folds, scoring='r2')
-                        st.metric("5-Fold CV 평균 R²", f"{cv_scores.mean():.4f}")
+                        # SHAP Summary Plot
+                        fig_shap, ax_shap = plt.subplots(figsize=(10, 6))
+                        shap.summary_plot(shap_values, X_test, show=False)
+                        st.pyplot(fig_shap)
                         
-                        # 테스트 셋 점수
-                        y_pred = best_model.predict(X_test)
-                        r2 = r2_score(y_test, y_pred)
-                        mae = mean_absolute_error(y_test, y_pred)
-                        
-                        st.write(f"**테스트 세트 R²:** {r2:.4f}")
-                        st.write(f"**평균 오차 (MAE):** {mae:.4f} %PCE")
-                        st.caption(f"최적 파라미터: {grid_search.best_params_}")
-                        
-                        # 실제값 vs 예측값 그래프
-                        fig, ax = plt.subplots(figsize=(6, 5))
-                        ax.scatter(y_test, y_pred, alpha=0.6, edgecolors='w', color='#2980b9')
-                        ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
-                        ax.set_xlabel("Actual PCE (%)")
-                        ax.set_ylabel("Predicted PCE (%)")
-                        ax.set_title("Actual vs Predicted")
-                        ax.grid(True, alpha=0.3)
-                        st.pyplot(fig)
+                        # SHAP Bar Plot (단순 중요도 순위)
+                        st.markdown("**Feature Importance Ranking (SHAP based)**")
+                        fig_bar, ax_bar = plt.subplots(figsize=(10, 5))
+                        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+                        st.pyplot(fig_bar)
 
-                    with col2:
-                        st.subheader("🔑 중요 공정 변수 (Top 20)")
-                        
-                        # 중요도 추출
-                        importances = best_model.feature_importances_
-                        feat_imp_df = pd.DataFrame({'Feature': X.columns, 'Importance': importances})
-                        feat_imp_df = feat_imp_df.sort_values(by='Importance', ascending=False).head(20)
-                        
-                        # 중요도 그래프
-                        fig2, ax2 = plt.subplots(figsize=(6, 8))
-                        sns.barplot(x='Importance', y='Feature', data=feat_imp_df, palette='viridis', ax=ax2)
-                        ax2.set_title("Feature Importance")
-                        st.pyplot(fig2)
-
+                    # [Tab 3: 최적화 제안]
                     st.markdown("---")
-                    
-                    # 6. 실험 방향 제안
-                    st.header("💡 AI 기반 실험 제안")
-                    st.write("현재 데이터셋 내 **최고 효율 장치**의 레시피와 **중요 변수**를 기반으로 분석한 결과입니다.")
+                    st.subheader("3. Optimization Suggestions")
                     
                     best_idx = y.idxmax()
-                    best_val = y.max()
+                    st.success(f"현재 데이터셋 최고 효율: **{y.max():.2f}%** (Sample ID: {best_idx})")
                     
-                    st.success(f"🏆 현재 최고 효율: **{best_val:.2f}%** (Sample ID: {best_idx})")
+                    # 중요 변수 추출 (SHAP 절대값 평균 기준)
+                    feature_importance = pd.DataFrame({
+                        'feature': X.columns,
+                        'importance': np.abs(shap_values.values).mean(axis=0)
+                    }).sort_values('importance', ascending=False)
                     
-                    # 최고 효율 레시피 추출
+                    top_features = feature_importance['feature'].head(5).tolist()
+                    
+                    st.markdown("#### 🔬 핵심 제어 변수 (Top 5)")
+                    st.write("다음 변수들을 중심으로 실험 조건을 미세 조정(Fine-tuning) 하세요.")
+                    
                     best_recipe = df_clean.loc[best_idx]
-                    
-                    # 중요 변수 상위 5개에 대한 제안 생성
                     suggestions = []
-                    for feat in feat_imp_df['Feature'].head(5):
-                        # 원본 컬럼 찾기 (MLB 전의 이름 추적)
-                        # 예: Solvent_DMF -> Solvent
-                        original_col = next((c for c in X_raw_origin.columns if feat.startswith(c)), None)
+                    
+                    for feat in top_features:
+                         # 원래 컬럼 이름 찾기
+                        original_col = next((c for c in X_raw_origin.columns if feat.startswith(c)), feat)
+                        current_val = best_recipe.get(original_col, best_recipe.get(feat, "N/A"))
                         
-                        if original_col:
-                            val = best_recipe.get(original_col, "N/A")
-                            suggestions.append({
-                                "중요 변수 (Feature)": feat,
-                                "원인 변수": original_col,
-                                "최고 효율 조건 값": val,
-                                "제안": "이 변수는 성능에 매우 중요합니다. 위 값을 중심으로 미세 조정(Fine-tuning) 하세요."
-                            })
-                        else:
-                            # 수치형 변수일 경우
-                            val = best_recipe.get(feat, "N/A")
-                            suggestions.append({
-                                "중요 변수 (Feature)": feat,
-                                "원인 변수": feat,
-                                "최고 효율 조건 값": val,
-                                "제안": "수치형 중요 변수입니다. 이 값 주변으로 범위를 좁혀 최적화하세요."
-                            })
+                        suggestions.append({
+                            "Rank": top_features.index(feat) + 1,
+                            "Feature": feat,
+                            "Best Sample Value": current_val,
+                            "Action": "SHAP 그래프를 참조하여 이 값을 중심으로 탐색 범위를 좁히세요."
+                        })
                     
                     st.table(pd.DataFrame(suggestions))
 
 else:
-    st.info("왼쪽 사이드바에서 데이터 파일을 업로드해주세요.")
+    st.info("👈 Please upload your data file to start.")
     st.markdown("""
-    ### 👋 환영합니다!
-    이 앱은 페로브스카이트 태양전지 공정 데이터를 분석하여 최적의 레시피를 제안합니다.
-    
-    **데이터 파일 형식:**
-    - `.csv` 또는 `.xlsx`
-    - 필수 컬럼: `PCE (%)`
-    - 그 외 공정 변수들 (예: `Temp`, `Solvent`, `Additive` 등)
+    ### 📚 Reference
+    본 시스템은 다음과 같은 최신 연구 방법론을 따릅니다:
+    1.  **XGBoost Algorithm**: Tabular data에서 우수한 성능을 보이는 Tree-based ensemble 모델.
+    2.  **SHAP (SHapley Additive exPlanations)**: 블랙박스 모델의 내부 작동 원리를 게임 이론으로 해석하여 과학적 통찰 제공.
+    3.  **Cross-Validation**: 5-Fold 교차 검증을 통한 신뢰성 있는 성능 평가.
     """)
