@@ -94,16 +94,24 @@ def preprocess_data(df, target_column):
     if len(df_cleaned) == 0:
         return None, None, None, None
 
-    # 2. 결과 지표 제거 (Data Leakage 방지)
+    # 2. 결과 지표 및 타겟 제거 (Data Leakage 방지)
+    # PCE, Voc, Jsc, FF 등 결과값은 입력 변수(X)에 들어가면 안 됩니다.
     drop_keywords = ['PCE', 'Voc', 'Jsc', 'FF', 'Rs', 'Rsh', 'Scan', 'Sample', 'File', 'Unnamed']
-    cols_to_drop = []
+    
+    # 타겟 컬럼은 무조건 삭제 리스트에 포함
+    cols_to_drop = [target_column]
+    
     for col in df_cleaned.columns:
-        if col == target_column: continue
+        if col == target_column: 
+            continue # 이미 추가했으므로 패스
+            
+        # 키워드가 포함된 컬럼 찾아서 추가 (대소문자 무시 체크 권장되나 여기선 단순 포함)
         for kw in drop_keywords:
             if kw in col:
                 cols_to_drop.append(col)
                 break
     
+    # 입력 변수(X)와 타겟(y) 분리
     X_raw = df_cleaned.drop(columns=cols_to_drop, errors='ignore')
     y = df_cleaned[target_column]
     
@@ -368,16 +376,24 @@ if uploaded_files:
                         importances = res['model'].feature_importances_
                 else:
                     st.info("Gaussian Process는 SHAP 대신 상관계수(Correlation)를 기반으로 중요도를 추정합니다.")
-                    # 간단한 상관계수 히트맵
-                    corr = res['X'].copy()
-                    corr['Target'] = res['y']
-                    corr_matrix = corr.corr()[['Target']].sort_values(by='Target', key=abs, ascending=False).head(10)
-                    st.dataframe(corr_matrix.style.background_gradient(cmap='coolwarm'))
-                    importances = np.abs(corr.corr()[res['target_col']].drop(res['target_col']).values)
-                    # 중요도 배열 크기 맞춤 (X 컬럼 순서대로 정렬 필요 - 위 코드는 근사치)
-                    # 정확한 매핑을 위해 다시 계산
-                    full_corr = corr.corr()[res['target_col']].drop(res['target_col'])
-                    importances = np.abs(full_corr[res['X'].columns].values)
+                    
+                    # 상관계수 계산을 위해 임시로 Target 컬럼 추가
+                    corr_df = res['X'].copy()
+                    corr_df['Target'] = res['y'].values
+                    
+                    # 상관계수 매트릭스 계산
+                    corr_matrix = corr_df.corr()
+                    
+                    # 타겟 변수와의 상관관계만 추출 (상위 10개)
+                    target_corr = corr_matrix[['Target']].sort_values(by='Target', key=abs, ascending=False).drop('Target').head(10)
+                    
+                    st.dataframe(target_corr.style.background_gradient(cmap='coolwarm'))
+                    
+                    # 중요도 배열 (절대값 상관계수) - X 컬럼 순서대로 매핑
+                    # 전체 상관계수 계산 후 X 순서에 맞게 정렬
+                    full_target_corr = corr_matrix['Target'].drop('Target')
+                    # X 컬럼 순서대로 값 추출 (결측치는 0 처리)
+                    importances = np.abs(full_target_corr.reindex(res['X'].columns).fillna(0).values)
 
             with tab3:
                 st.subheader("실험 조건 최적화 제안")
