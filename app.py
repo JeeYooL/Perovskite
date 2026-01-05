@@ -82,10 +82,12 @@ def preprocess_data(df):
         # 'FAI + MACl' 같은 복합 조성을 개별 성분으로 분리 (One-Hot Encoding 확장)
         binarized = X_categorical[col].fillna('').astype(str).str.get_dummies(sep=' + ')
         binarized = binarized.add_prefix(f"{col}_")
-        binarized.columns = binarized.columns.str.replace(r'[^\w\s]', '_', regex=True).str.replace(r'\s+', '_', regex=True)
         all_processed_dfs.append(binarized)
         
     X_processed = pd.concat(all_processed_dfs, axis=1).fillna(0)
+    
+    # [수정됨] XGBoost 호환성을 위해 **모든 컬럼명**에서 특수문자 제거 (수치형 변수 포함)
+    X_processed.columns = X_processed.columns.str.replace(r'[^\w\s]', '_', regex=True).str.replace(r'\s+', '_', regex=True)
     
     return X_processed, y, df_cleaned, X_raw
 
@@ -130,10 +132,12 @@ if uploaded_files:
                     # 3. XGBoost 모델 및 하이퍼파라미터 설정
                     xgb_model = xgb.XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42)
                     
+                    # 데이터셋 크기에 따른 하이퍼파라미터 조정
+                    # 데이터가 적을 경우 과적합 방지를 위해 max_depth를 낮추고 n_estimators를 줄임
                     param_grid = {
-                        'n_estimators': [100, 300],
-                        'learning_rate': [0.05, 0.1],
-                        'max_depth': [3, 5, 7],
+                        'n_estimators': [100, 200, 300],
+                        'learning_rate': [0.01, 0.05, 0.1],
+                        'max_depth': [3, 5],
                         'subsample': [0.8, 1.0]
                     }
                     
@@ -142,98 +146,112 @@ if uploaded_files:
                         param_grid, 
                         cv=cv_folds, 
                         scoring='neg_mean_absolute_error',
-                        verbose=0
+                        verbose=1,
+                        error_score='raise' # 에러 발생 시 무시하지 않고 출력
                     )
                     
-                    grid_search.fit(X_train, y_train)
-                    best_model = grid_search.best_estimator_
-                    
-                    # ----------------------------------------------------------------
-                    # 결과 대시보드
-                    # ----------------------------------------------------------------
-                    
-                    # [Tab 1: 성능]
-                    st.subheader("1. Model Performance")
-                    col1, col2, col3 = st.columns(3)
-                    
-                    y_pred = best_model.predict(X_test)
-                    r2 = r2_score(y_test, y_pred)
-                    mae = mean_absolute_error(y_test, y_pred)
-                    cv_r2 = cross_val_score(best_model, X, y, cv=cv_folds, scoring='r2').mean()
-                    
-                    col1.metric("Test R² Score", f"{r2:.4f}")
-                    col2.metric("Mean Absolute Error", f"{mae:.4f} %")
-                    col3.metric("Cross-Validation R²", f"{cv_r2:.4f}")
-                    
-                    # 예측 그래프
-                    fig, ax = plt.subplots(figsize=(8, 4))
-                    ax.scatter(y_test, y_pred, alpha=0.6, color='#2c3e50', edgecolors='w')
-                    ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
-                    ax.set_xlabel("Experimental PCE (%)")
-                    ax.set_ylabel("Predicted PCE (%)")
-                    ax.set_title("Prediction Accuracy")
-                    ax.grid(True, alpha=0.3)
-                    st.pyplot(fig)
-                    
-                    # [Tab 2: SHAP 분석 (XAI)]
-                    st.markdown("---")
-                    st.subheader("2. Explainable AI (SHAP Analysis)")
-                    st.markdown("""
-                    **SHAP Summary Plot**은 각 공정 변수가 효율에 미치는 영향을 보여줍니다.
-                    * **점의 색상**: 변수의 값 (빨강=높음, 파랑=낮음)
-                    * **X축 위치**: 효율에 미치는 영향 (오른쪽=효율 증가, 왼쪽=효율 감소)
-                    * *예: 'Temperature'가 빨간색(고온)일 때 오른쪽(양의 값)에 있다면, 온도가 높을수록 효율이 좋다는 의미입니다.*
-                    """)
-                    
-                    with st.spinner("Calculating SHAP values..."):
-                        explainer = shap.Explainer(best_model, X_train)
-                        shap_values = explainer(X_test)
+                    try:
+                        grid_search.fit(X_train, y_train)
+                        best_model = grid_search.best_estimator_
                         
-                        # SHAP Summary Plot
-                        fig_shap, ax_shap = plt.subplots(figsize=(10, 6))
-                        shap.summary_plot(shap_values, X_test, show=False)
-                        st.pyplot(fig_shap)
+                        # ----------------------------------------------------------------
+                        # 결과 대시보드
+                        # ----------------------------------------------------------------
                         
-                        # SHAP Bar Plot (단순 중요도 순위)
-                        st.markdown("**Feature Importance Ranking (SHAP based)**")
-                        fig_bar, ax_bar = plt.subplots(figsize=(10, 5))
-                        shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
-                        st.pyplot(fig_bar)
+                        # [Tab 1: 성능]
+                        st.subheader("1. Model Performance")
+                        col1, col2, col3 = st.columns(3)
+                        
+                        y_pred = best_model.predict(X_test)
+                        r2 = r2_score(y_test, y_pred)
+                        mae = mean_absolute_error(y_test, y_pred)
+                        cv_r2 = cross_val_score(best_model, X, y, cv=cv_folds, scoring='r2').mean()
+                        
+                        col1.metric("Test R² Score", f"{r2:.4f}")
+                        col2.metric("Mean Absolute Error", f"{mae:.4f} %")
+                        col3.metric("Cross-Validation R²", f"{cv_r2:.4f}")
+                        
+                        # 예측 그래프
+                        fig, ax = plt.subplots(figsize=(8, 4))
+                        ax.scatter(y_test, y_pred, alpha=0.6, color='#2c3e50', edgecolors='w')
+                        ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
+                        ax.set_xlabel("Experimental PCE (%)")
+                        ax.set_ylabel("Predicted PCE (%)")
+                        ax.set_title("Prediction Accuracy")
+                        ax.grid(True, alpha=0.3)
+                        st.pyplot(fig)
+                        
+                        # [Tab 2: SHAP 분석 (XAI)]
+                        st.markdown("---")
+                        st.subheader("2. Explainable AI (SHAP Analysis)")
+                        st.markdown("""
+                        **SHAP Summary Plot**은 각 공정 변수가 효율에 미치는 영향을 보여줍니다.
+                        * **점의 색상**: 변수의 값 (빨강=높음, 파랑=낮음)
+                        * **X축 위치**: 효율에 미치는 영향 (오른쪽=효율 증가, 왼쪽=효율 감소)
+                        """)
+                        
+                        with st.spinner("Calculating SHAP values..."):
+                            explainer = shap.Explainer(best_model, X_train)
+                            shap_values = explainer(X_test)
+                            
+                            # SHAP Summary Plot
+                            fig_shap, ax_shap = plt.subplots(figsize=(10, 6))
+                            shap.summary_plot(shap_values, X_test, show=False)
+                            st.pyplot(fig_shap)
+                            
+                            # SHAP Bar Plot
+                            st.markdown("**Feature Importance Ranking (SHAP based)**")
+                            fig_bar, ax_bar = plt.subplots(figsize=(10, 5))
+                            shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+                            st.pyplot(fig_bar)
 
-                    # [Tab 3: 최적화 제안]
-                    st.markdown("---")
-                    st.subheader("3. Optimization Suggestions")
-                    
-                    best_idx = y.idxmax()
-                    st.success(f"현재 데이터셋 최고 효율: **{y.max():.2f}%** (Sample ID: {best_idx})")
-                    
-                    # 중요 변수 추출 (SHAP 절대값 평균 기준)
-                    feature_importance = pd.DataFrame({
-                        'feature': X.columns,
-                        'importance': np.abs(shap_values.values).mean(axis=0)
-                    }).sort_values('importance', ascending=False)
-                    
-                    top_features = feature_importance['feature'].head(5).tolist()
-                    
-                    st.markdown("#### 🔬 핵심 제어 변수 (Top 5)")
-                    st.write("다음 변수들을 중심으로 실험 조건을 미세 조정(Fine-tuning) 하세요.")
-                    
-                    best_recipe = df_clean.loc[best_idx]
-                    suggestions = []
-                    
-                    for feat in top_features:
-                         # 원래 컬럼 이름 찾기
-                        original_col = next((c for c in X_raw_origin.columns if feat.startswith(c)), feat)
-                        current_val = best_recipe.get(original_col, best_recipe.get(feat, "N/A"))
+                        # [Tab 3: 최적화 제안]
+                        st.markdown("---")
+                        st.subheader("3. Optimization Suggestions")
                         
-                        suggestions.append({
-                            "Rank": top_features.index(feat) + 1,
-                            "Feature": feat,
-                            "Best Sample Value": current_val,
-                            "Action": "SHAP 그래프를 참조하여 이 값을 중심으로 탐색 범위를 좁히세요."
-                        })
-                    
-                    st.table(pd.DataFrame(suggestions))
+                        best_idx = y.idxmax()
+                        st.success(f"현재 데이터셋 최고 효율: **{y.max():.2f}%** (Sample ID: {best_idx})")
+                        
+                        feature_importance = pd.DataFrame({
+                            'feature': X.columns,
+                            'importance': np.abs(shap_values.values).mean(axis=0)
+                        }).sort_values('importance', ascending=False)
+                        
+                        top_features = feature_importance['feature'].head(5).tolist()
+                        
+                        st.markdown("#### 🔬 핵심 제어 변수 (Top 5)")
+                        st.write("다음 변수들을 중심으로 실험 조건을 미세 조정(Fine-tuning) 하세요.")
+                        
+                        best_recipe = df_clean.loc[best_idx]
+                        suggestions = []
+                        
+                        for feat in top_features:
+                            # 원래 컬럼 이름 매칭 시도 (정규식 처리 전 이름 찾기)
+                            # 완전 정확한 매칭은 어렵지만, feature 이름이 포함된 원본 컬럼을 찾습니다.
+                            original_col = feat
+                            for raw_col in X_raw_origin.columns:
+                                # 특수문자 제거된 버전과 비교
+                                cleaned_raw = re.sub(r'[^\w\s]', '_', str(raw_col))
+                                cleaned_raw = re.sub(r'\s+', '_', cleaned_raw)
+                                if cleaned_raw == feat:
+                                    original_col = raw_col
+                                    break
+                            
+                            current_val = best_recipe.get(original_col, "N/A")
+                            
+                            suggestions.append({
+                                "Rank": top_features.index(feat) + 1,
+                                "Feature (Cleaned)": feat,
+                                "Original Feature": original_col,
+                                "Best Sample Value": current_val,
+                                "Action": "SHAP 그래프를 참조하여 최적화 방향(증가/감소) 설정"
+                            })
+                        
+                        st.table(pd.DataFrame(suggestions))
+
+                    except Exception as e:
+                        st.error(f"모델 학습 중 오류가 발생했습니다: {e}")
+                        st.error("데이터의 컬럼명에 특수문자가 포함되어 있거나, 데이터셋 크기가 너무 작을 수 있습니다.")
 
 else:
     st.info("👈 Please upload your data file to start.")
