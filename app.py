@@ -24,7 +24,7 @@ import shap
 # 페이지 설정
 # -------------------------------------------------------------------
 st.set_page_config(
-    page_title="Perovskite AI Lab V5",
+    page_title="Perovskite AI Lab V6",
     page_icon="🧪",
     layout="wide"
 )
@@ -131,6 +131,20 @@ def preprocess_data(df, target_column):
     # 4. 특수문자 제거 (컬럼명)
     X_processed.columns = X_processed.columns.str.replace(r'[^\w\s]', '_', regex=True).str.replace(r'\s+', '_', regex=True)
     
+    # [수정됨] 4-1. 중복 컬럼명 처리 (XGBoost 에러 방지 핵심)
+    # 특수문자 제거 후 이름이 같아진 컬럼들(예: A-B -> A_B, A+B -> A_B)에 접미사 추가
+    if X_processed.columns.duplicated().any():
+        new_columns = []
+        seen = {}
+        for col in X_processed.columns:
+            if col in seen:
+                seen[col] += 1
+                new_columns.append(f"{col}_{seen[col]}")
+            else:
+                seen[col] = 0
+                new_columns.append(col)
+        X_processed.columns = new_columns
+    
     # 5. [중요] 모든 데이터를 float형으로 강제 변환 (에러 방지)
     try:
         X_processed = X_processed.astype(float)
@@ -145,7 +159,7 @@ def preprocess_data(df, target_column):
 # 메인 UI
 # -------------------------------------------------------------------
 
-st.title("🧪 Perovskite AI Lab V5")
+st.title("🧪 Perovskite AI Lab V6")
 st.write("재료 탐색 및 공정 최적화를 위한 지능형 분석 플랫폼")
 st.markdown("---")
 
@@ -257,7 +271,7 @@ if uploaded_files:
                                 'max_depth': [3, 5],
                                 'learning_rate': [0.05, 0.1]
                             }
-                            search = GridSearchCV(xgb_reg, param_grid, cv=3, scoring='neg_mean_absolute_error')
+                            search = GridSearchCV(xgb_reg, param_grid, cv=3, scoring='neg_mean_absolute_error', error_score='raise')
                             search.fit(X_train, y_train)
                             model = search.best_estimator_
 
@@ -325,6 +339,7 @@ if uploaded_files:
                         
                 except Exception as e:
                     st.error(f"모델 학습 중 오류 발생: {e}")
+                    st.write(f"상세 에러: {str(e)}")
 
         # ----------------------------------------------------------------
         # 4. 결과 리포트 (저장된 세션 데이터로 표시)
@@ -377,22 +392,17 @@ if uploaded_files:
                 else:
                     st.info("Gaussian Process는 SHAP 대신 상관계수(Correlation)를 기반으로 중요도를 추정합니다.")
                     
-                    # 상관계수 계산을 위해 임시로 Target 컬럼 추가
+                    # 상관계수 계산
                     corr_df = res['X'].copy()
                     corr_df['Target'] = res['y'].values
                     
-                    # 상관계수 매트릭스 계산
                     corr_matrix = corr_df.corr()
-                    
-                    # 타겟 변수와의 상관관계만 추출 (상위 10개)
                     target_corr = corr_matrix[['Target']].sort_values(by='Target', key=abs, ascending=False).drop('Target').head(10)
                     
                     st.dataframe(target_corr.style.background_gradient(cmap='coolwarm'))
                     
-                    # 중요도 배열 (절대값 상관계수) - X 컬럼 순서대로 매핑
-                    # 전체 상관계수 계산 후 X 순서에 맞게 정렬
+                    # 중요도 배열
                     full_target_corr = corr_matrix['Target'].drop('Target')
-                    # X 컬럼 순서대로 값 추출 (결측치는 0 처리)
                     importances = np.abs(full_target_corr.reindex(res['X'].columns).fillna(0).values)
 
             with tab3:
@@ -410,21 +420,40 @@ if uploaded_files:
                     # 원본 컬럼 찾기
                     orig = feat
                     for raw_c in res['X_raw_origin'].columns:
-                        # 전처리된 이름과 매칭되는지 확인
                         if re.sub(r'[^\w]', '_', str(raw_c)) in feat:
                             orig = raw_c
                             break
                     
                     val = best_recipe.get(orig, best_recipe.get(feat, "N/A"))
+                    
+                    # --- [추가 기능] 연관 상세 조건(Context) 자동 탐색 ---
+                    parts = str(orig).split('_')
+                    if len(parts) >= 2:
+                        prefix_group = "_".join(parts[:2])
+                    else:
+                        prefix_group = parts[0]
+                    
+                    context_list = []
+                    for col_name in best_recipe.index:
+                        if col_name == orig: continue
+                        if str(col_name).startswith(prefix_group):
+                            detail_val = best_recipe[col_name]
+                            if pd.notna(detail_val) and str(detail_val).strip() != '':
+                                short_name = str(col_name).replace(prefix_group, '').strip('_')
+                                context_list.append(f"{short_name}: {detail_val}")
+                    
+                    context_str = " | ".join(context_list) if context_list else "-"
+                    
                     suggestions.append({
                         "중요 변수": feat,
                         "현재 최고값": val,
+                        "세부 공정 조건 (Context)": context_str,
                         "제안": "이 변수의 주변 값을 탐색(Exploration) 하세요."
                     })
                 
                 st.table(pd.DataFrame(suggestions))
             
-            # 하단 여백 추가 (스크롤 문제 해결)
+            # 하단 여백 추가
             st.markdown('<div class="bottom-spacer"></div>', unsafe_allow_html=True)
 
 else:
