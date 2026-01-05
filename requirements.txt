@@ -1,10 +1,7 @@
 streamlit
 pandas
 numpy
-plotly
-scikit-learn
-opencv-python-headless
-pillow
-openpyxl
 matplotlib
-scikit-image
+seaborn
+scikit-learn
+openpyxl
