@@ -49,7 +49,9 @@ if uploaded_file:
         exclude_cols = ['Sample', 'File', 'Scan Direction', target_col]
         feature_candidates = [c for c in df.columns if c not in exclude_cols]
         
-        selected_features = st.multiselect("학습에 사용할 변수(Feature) 선택", feature_candidates, default=[c for c in feature_candidates if c.startswith('HTL') or c.startswith('Perovskite')][:5])
+        # 기본 선택 변수 추천 (HTL, Perovskite 관련)
+        default_features = [c for c in feature_candidates if c.startswith('HTL') or c.startswith('Perovskite') or c.startswith('TCO') or c.startswith('ETL')][:5]
+        selected_features = st.multiselect("학습에 사용할 변수(Feature) 선택", feature_candidates, default=default_features)
         
         if not selected_features:
             st.warning("최소 1개 이상의 변수를 선택해주세요.")
@@ -86,6 +88,10 @@ if uploaded_file:
             X = X[valid_idx]
             y = y[valid_idx]
             
+            if len(X) < 10:
+                st.error("유효한 데이터가 너무 적습니다 (10개 미만). 더 많은 데이터를 확보하거나 전처리 방식을 확인하세요.")
+                st.stop()
+
             # Train/Test Split
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             
@@ -117,16 +123,18 @@ if uploaded_file:
             # 2. Actual vs Predicted Plot
             st.markdown("#### 🎯 Prediction Accuracy (실제값 vs 예측값)")
             fig_pred = px.scatter(x=y_test, y=y_pred, labels={'x': 'Actual PCE', 'y': 'Predicted PCE'}, title="Actual vs Predicted")
-            fig_pred.add_shape(type="line", line=dict(dash='dash'), x0=y.min(), y0=y.max(), x1=y.min(), y1=y.max())
+            # 기준선 (y=x) 추가
+            fig_pred.add_shape(type="line", line=dict(dash='dash', color='gray'), x0=y.min(), y0=y.max(), x1=y.min(), y1=y.max())
             st.plotly_chart(fig_pred, use_container_width=True)
             
             # 3. Correlation Scatter Plot (Top Feature)
-            top_feature = feature_imp_df.iloc[-1]['Feature']
-            st.markdown(f"#### 🔍 Top Factor Analysis: {top_feature} vs {target_col}")
-            
-            # 원본 데이터(df)를 사용하여 시각화 (인코딩 전 값 사용)
-            fig_scatter = px.scatter(df, x=top_feature, y=target_col, color=target_col, title=f"Correlation: {top_feature} vs {target_col}")
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            if not feature_imp_df.empty:
+                top_feature = feature_imp_df.iloc[-1]['Feature']
+                st.markdown(f"#### 🔍 Top Factor Analysis: {top_feature} vs {target_col}")
+                
+                # 원본 데이터(df)를 사용하여 시각화 (인코딩 전 값 사용)
+                fig_scatter = px.scatter(df, x=top_feature, y=target_col, color=target_col, title=f"Correlation: {top_feature} vs {target_col}")
+                st.plotly_chart(fig_scatter, use_container_width=True)
 
             # --- [5] 최적화 시뮬레이터 (Optional) ---
             st.markdown("---")
@@ -134,6 +142,8 @@ if uploaded_file:
             st.info("아래 변수들을 조절하여 예상 PCE를 예측해보세요.")
             
             input_data = {}
+            
+            # 입력 폼 생성 (3단 컬럼)
             cols = st.columns(3)
             
             for i, col_name in enumerate(selected_features):
@@ -141,24 +151,42 @@ if uploaded_file:
                 
                 # 범주형인 경우
                 if col_name in cat_cols:
-                    # 원본 데이터의 unique 값들 가져오기
-                    options = list(label_encoders[col_name].classes_)
-                    val = col_obj.selectbox(f"{col_name}", options)
-                    # 인코딩해서 저장
-                    input_data[col_name] = label_encoders[col_name].transform([val])[0]
+                    # 원본 데이터의 unique 값들 가져오기 (라벨 인코더의 클래스 정보 활용)
+                    if col_name in label_encoders:
+                        options = list(label_encoders[col_name].classes_)
+                        val = col_obj.selectbox(f"{col_name}", options)
+                        # 인코딩해서 저장
+                        input_data[col_name] = label_encoders[col_name].transform([val])[0]
+                    else:
+                        st.warning(f"인코더 정보 없음: {col_name}")
                 
                 # 숫자형인 경우
                 else:
                     min_val = float(df[col_name].min())
                     max_val = float(df[col_name].max())
                     mean_val = float(df[col_name].mean())
+                    
+                    # 범위가 0이면 슬라이더 오류 방지를 위해 약간 조정
+                    if min_val == max_val:
+                        min_val -= 0.1
+                        max_val += 0.1
+                        
                     val = col_obj.slider(f"{col_name}", min_val, max_val, mean_val)
                     input_data[col_name] = val
             
             if st.button("Predict PCE for these conditions"):
+                # 입력 데이터를 DataFrame으로 변환 (컬럼 순서 맞춤)
                 input_df = pd.DataFrame([input_data])
-                pred_pce = rf.predict(input_df)[0]
-                st.success(f"🧪 예측된 PCE: **{pred_pce:.2f}%**")
+                
+                # 모델 예측
+                try:
+                    pred_pce = rf.predict(input_df)[0]
+                    st.success(f"🧪 예측된 PCE: **{pred_pce:.2f}%**")
+                except Exception as e:
+                    st.error(f"예측 중 오류 발생: {e}")
+
+    except Exception as e:
+        st.error(f"파일 처리 중 오류가 발생했습니다: {e}")
 
 else:
     st.info("👈 왼쪽 사이드바에서 데이터 파일을 업로드해주세요.")
