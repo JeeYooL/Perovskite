@@ -21,7 +21,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 스타일 커스텀 (논문 스타일의 깔끔한 디자인)
+# 스타일 커스텀
 st.markdown("""
     <style>
     .main { background-color: #ffffff; }
@@ -40,7 +40,11 @@ def load_data(uploaded_files):
     for uploaded_file in uploaded_files:
         try:
             if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
+                # encoding 관련 에러 방지를 위한 시도
+                try:
+                    df = pd.read_csv(uploaded_file, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(uploaded_file, encoding='cp949')
                 all_dfs.append(df)
             elif uploaded_file.name.endswith('.xlsx'):
                 df = pd.read_excel(uploaded_file)
@@ -53,21 +57,49 @@ def load_data(uploaded_files):
     return None
 
 def preprocess_data(df):
-    """데이터 전처리: 결측치 제거, 타겟 분리, MLB(Multi-Label Binarization)"""
+    """데이터 전처리: 유연한 타겟 컬럼 찾기, 결측치 제거, MLB, 컬럼명 정제"""
+    
+    # 1. 컬럼명 공백 제거 (실수 방지)
+    df.columns = df.columns.str.strip()
+    
+    # 2. 타겟 컬럼('PCE') 자동 탐색
+    # 사용자가 말한 '특수문자 이슈'를 피하기 위해 정확한 이름 대신 'PCE'가 포함된 컬럼을 찾습니다.
     target_column = 'PCE (%)'
     
     if target_column not in df.columns:
-        st.error(f"데이터에 '{target_column}' 컬럼이 없습니다.")
-        return None, None, None, None
+        # 'PCE'라는 단어가 포함된 컬럼을 후보로 찾음 (대소문자 구분 없이)
+        pce_candidates = [c for c in df.columns if 'PCE' in c.upper()]
+        
+        if len(pce_candidates) > 0:
+            target_column = pce_candidates[0] # 첫 번째 후보를 타겟으로 설정
+            st.info(f"ℹ️ '{target_column}' 컬럼을 타겟 값(효율)으로 자동 인식했습니다.")
+        else:
+            st.error("데이터에서 'PCE' 관련 컬럼(예: PCE (%), PCE)을 찾을 수 없습니다. CSV 파일을 확인해주세요.")
+            return None, None, None, None
 
+    # 타겟 값이 없는 행 제거
     df_cleaned = df.dropna(subset=[target_column]).copy()
     
     # Data Leakage 방지: 결과값 컬럼 제외
-    drop_cols = [
-        'PCE (%)', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)',
-        'Sample', 'File', 'Scan Direction', 'Unnamed: 0'
-    ]
-    cols_to_drop = [c for c in drop_cols if c in df_cleaned.columns]
+    # PCE 외에 전압, 전류 등 결과 지표들도 제거해야 합니다.
+    drop_keywords = ['PCE', 'Voc', 'Jsc', 'FF', 'Rs', 'Rsh', 'Scan Direction', 'Sample', 'File']
+    
+    # 삭제할 컬럼 찾기
+    cols_to_drop = []
+    for col in df_cleaned.columns:
+        # 타겟 컬럼은 당연히 y로 가므로 X에서는 제외
+        if col == target_column:
+            cols_to_drop.append(col)
+            continue
+            
+        # 결과 지표들 포함 여부 확인
+        for kw in drop_keywords:
+            if kw in col:
+                cols_to_drop.append(col)
+                break
+                
+    # Unnamed 컬럼 제거
+    cols_to_drop += [c for c in df_cleaned.columns if 'Unnamed' in c]
     
     X_raw = df_cleaned.drop(columns=cols_to_drop, errors='ignore')
     y = df_cleaned[target_column]
@@ -79,14 +111,16 @@ def preprocess_data(df):
     all_processed_dfs = [X_numeric]
 
     for col in X_categorical.columns:
-        # 'FAI + MACl' 같은 복합 조성을 개별 성분으로 분리 (One-Hot Encoding 확장)
+        # 'FAI + MACl' 같은 복합 조성을 개별 성분으로 분리
         binarized = X_categorical[col].fillna('').astype(str).str.get_dummies(sep=' + ')
         binarized = binarized.add_prefix(f"{col}_")
         all_processed_dfs.append(binarized)
         
     X_processed = pd.concat(all_processed_dfs, axis=1).fillna(0)
     
-    # [수정됨] XGBoost 호환성을 위해 **모든 컬럼명**에서 특수문자 제거 (수치형 변수 포함)
+    # [중요] XGBoost 호환성을 위해 **모든 컬럼명**에서 특수문자 제거
+    # 이 작업은 데이터를 다 만든 후(X_processed)에 수행하므로,
+    # 초기에 'PCE (%)' 컬럼을 찾는 과정에는 영향을 주지 않습니다.
     X_processed.columns = X_processed.columns.str.replace(r'[^\w\s]', '_', regex=True).str.replace(r'\s+', '_', regex=True)
     
     return X_processed, y, df_cleaned, X_raw
@@ -119,21 +153,23 @@ if uploaded_files:
     if raw_df is not None:
         st.write(f"✅ Loaded **{len(raw_df)}** samples.")
         
+        # 간단한 데이터 미리보기 (디버깅용)
+        with st.expander("데이터 미리보기 (상위 5행)"):
+            st.dataframe(raw_df.head())
+        
         if st.button("🚀 Run AI Analysis (Train & Explain)"):
             with st.spinner('Preprocessing data & optimizing XGBoost model...'):
                 
-                # 1. 전처리
+                # 1. 전처리 (유연한 컬럼 탐색 적용됨)
                 X, y, df_clean, X_raw_origin = preprocess_data(raw_df)
                 
                 if X is not None:
                     # 2. 데이터 분할
                     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
                     
-                    # 3. XGBoost 모델 및 하이퍼파라미터 설정
+                    # 3. XGBoost 모델 설정
                     xgb_model = xgb.XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42)
                     
-                    # 데이터셋 크기에 따른 하이퍼파라미터 조정
-                    # 데이터가 적을 경우 과적합 방지를 위해 max_depth를 낮추고 n_estimators를 줄임
                     param_grid = {
                         'n_estimators': [100, 200, 300],
                         'learning_rate': [0.01, 0.05, 0.1],
@@ -147,16 +183,12 @@ if uploaded_files:
                         cv=cv_folds, 
                         scoring='neg_mean_absolute_error',
                         verbose=1,
-                        error_score='raise' # 에러 발생 시 무시하지 않고 출력
+                        error_score='raise'
                     )
                     
                     try:
                         grid_search.fit(X_train, y_train)
                         best_model = grid_search.best_estimator_
-                        
-                        # ----------------------------------------------------------------
-                        # 결과 대시보드
-                        # ----------------------------------------------------------------
                         
                         # [Tab 1: 성능]
                         st.subheader("1. Model Performance")
@@ -194,12 +226,10 @@ if uploaded_files:
                             explainer = shap.Explainer(best_model, X_train)
                             shap_values = explainer(X_test)
                             
-                            # SHAP Summary Plot
                             fig_shap, ax_shap = plt.subplots(figsize=(10, 6))
                             shap.summary_plot(shap_values, X_test, show=False)
                             st.pyplot(fig_shap)
                             
-                            # SHAP Bar Plot
                             st.markdown("**Feature Importance Ranking (SHAP based)**")
                             fig_bar, ax_bar = plt.subplots(figsize=(10, 5))
                             shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
@@ -220,45 +250,39 @@ if uploaded_files:
                         top_features = feature_importance['feature'].head(5).tolist()
                         
                         st.markdown("#### 🔬 핵심 제어 변수 (Top 5)")
-                        st.write("다음 변수들을 중심으로 실험 조건을 미세 조정(Fine-tuning) 하세요.")
-                        
                         best_recipe = df_clean.loc[best_idx]
                         suggestions = []
                         
                         for feat in top_features:
-                            # 원래 컬럼 이름 매칭 시도 (정규식 처리 전 이름 찾기)
-                            # 완전 정확한 매칭은 어렵지만, feature 이름이 포함된 원본 컬럼을 찾습니다.
+                            # 원본 컬럼 찾기 (정제된 이름 -> 원본 이름 매핑)
                             original_col = feat
-                            for raw_col in X_raw_origin.columns:
-                                # 특수문자 제거된 버전과 비교
-                                cleaned_raw = re.sub(r'[^\w\s]', '_', str(raw_col))
-                                cleaned_raw = re.sub(r'\s+', '_', cleaned_raw)
-                                if cleaned_raw == feat:
-                                    original_col = raw_col
-                                    break
+                            # 1. 완벽 매칭 시도
+                            if feat in X_raw_origin.columns:
+                                original_col = feat
+                            else:
+                                # 2. 부분 매칭 (특수문자 처리 전후 비교)
+                                for raw_col in X_raw_origin.columns:
+                                    cleaned_raw = re.sub(r'[^\w\s]', '_', str(raw_col))
+                                    cleaned_raw = re.sub(r'\s+', '_', cleaned_raw)
+                                    if cleaned_raw == feat:
+                                        original_col = raw_col
+                                        break
                             
                             current_val = best_recipe.get(original_col, "N/A")
                             
                             suggestions.append({
                                 "Rank": top_features.index(feat) + 1,
-                                "Feature (Cleaned)": feat,
-                                "Original Feature": original_col,
-                                "Best Sample Value": current_val,
-                                "Action": "SHAP 그래프를 참조하여 최적화 방향(증가/감소) 설정"
+                                "Feature (AI Name)": feat,
+                                "Original Column": original_col,
+                                "Best Value": current_val,
+                                "Action": "SHAP 그래프 참조하여 미세 조정"
                             })
                         
                         st.table(pd.DataFrame(suggestions))
 
                     except Exception as e:
                         st.error(f"모델 학습 중 오류가 발생했습니다: {e}")
-                        st.error("데이터의 컬럼명에 특수문자가 포함되어 있거나, 데이터셋 크기가 너무 작을 수 있습니다.")
+                        st.write("힌트: 데이터의 양이 너무 적거나(최소 20개 이상 권장), XGBoost가 처리할 수 없는 데이터 형식이 포함되었을 수 있습니다.")
 
 else:
     st.info("👈 Please upload your data file to start.")
-    st.markdown("""
-    ### 📚 Reference
-    본 시스템은 다음과 같은 최신 연구 방법론을 따릅니다:
-    1.  **XGBoost Algorithm**: Tabular data에서 우수한 성능을 보이는 Tree-based ensemble 모델.
-    2.  **SHAP (SHapley Additive exPlanations)**: 블랙박스 모델의 내부 작동 원리를 게임 이론으로 해석하여 과학적 통찰 제공.
-    3.  **Cross-Validation**: 5-Fold 교차 검증을 통한 신뢰성 있는 성능 평가.
-    """)
