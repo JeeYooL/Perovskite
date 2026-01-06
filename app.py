@@ -1,10 +1,20 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+
+# -------------------------------------------------------------------
+# [설정] Matplotlib 백엔드 (스레드 충돌 방지)
+# -------------------------------------------------------------------
+import matplotlib
+matplotlib.use('Agg') # 서버 전용(GUI 없음) 모드로 설정
 import matplotlib.pyplot as plt
+
 import seaborn as sns
 import io
 import re
+
+# 이미지 처리 라이브러리 (SEM 분석용)
+import cv2
 
 # 머신러닝 라이브러리
 from sklearn.model_selection import train_test_split, KFold, GridSearchCV, cross_val_score
@@ -24,27 +34,65 @@ import shap
 # 페이지 설정
 # -------------------------------------------------------------------
 st.set_page_config(
-    page_title="Perovskite AI Lab V6",
-    page_icon="🧪",
+    page_title="Perovskite AI Lab V7.1 (Bandgap)",
+    page_icon="⚗️",
     layout="wide"
 )
 
-# UI 스타일 개선 (스크롤 및 여백 확보)
+# CSS 스타일 커스텀
 st.markdown("""
     <style>
     .main { background-color: #ffffff; }
     h1, h2, h3 { color: #003366; font-family: 'Arial', sans-serif; }
-    .stMetric { background-color: #f8f9fa; padding: 15px; border-radius: 8px; border: 1px solid #e9ecef; }
-    .stAlert { padding: 10px; border-radius: 5px; }
-    /* 하단 여백 확보를 위한 클래스 */
-    .bottom-spacer { height: 300px; }
+    
+    /* 파일 업로더 컴팩트하게 만들기 */
+    [data-testid='stFileUploader'] {
+        padding-top: 0px;
+        padding-bottom: 0px;
+        margin-bottom: 0px;
+    }
+    [data-testid='stFileUploader'] section {
+        padding: 0px;
+        min-height: 40px; /* 높이 최소화 */
+        background-color: #f8f9fa;
+        border: 1px dashed #ced4da;
+    }
+    /* 업로드된 파일 이름 폰트 줄이기 */
+    [data-testid='stFileUploader'] section > div {
+        padding: 2px;
+    }
+    div[data-testid="stMarkdownContainer"] p {
+        font-size: 0.9rem;
+    }
+    
+    /* 테이블 헤더 스타일 */
+    .upload-header {
+        font-weight: bold;
+        text-align: center;
+        background-color: #e9ecef;
+        padding: 5px;
+        border-radius: 5px;
+        margin-bottom: 5px;
+        font-size: 0.9rem;
+    }
+    
+    /* 샘플 ID 셀 스타일 */
+    .sample-id-cell {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 42px; /* 업로더 높이와 맞춤 */
+        font-weight: bold;
+        color: #2c3e50;
+        background-color: #f1f3f5;
+        border-radius: 4px;
+        font-size: 0.9rem;
+    }
+    
+    .bottom-spacer { height: 100px; }
     </style>
 """, unsafe_allow_html=True)
 
-# -------------------------------------------------------------------
-# 세션 상태(Session State) 초기화
-# -------------------------------------------------------------------
-# 분석 결과가 새로고침(탭 클릭 등) 시에도 사라지지 않도록 저장소를 만듭니다.
 if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = None
 
@@ -53,7 +101,7 @@ if 'analysis_results' not in st.session_state:
 # -------------------------------------------------------------------
 
 def load_data(uploaded_files):
-    """파일 로드 및 병합"""
+    """메인 데이터 파일 로드"""
     all_dfs = []
     for uploaded_file in uploaded_files:
         try:
@@ -73,66 +121,194 @@ def load_data(uploaded_files):
         return pd.concat(all_dfs, ignore_index=True)
     return None
 
+def extract_features_from_spectra(file, data_type):
+    """
+    XRD, PL, TRPL 등 스펙트럼 데이터(X, Y)에서 핵심 Feature 추출
+    + [신규] PL 데이터인 경우 Bandgap 자동 계산 추가
+    """
+    try:
+        # 파일 내용 읽기 (파싱 로직)
+        file.seek(0)
+        try:
+            content = file.read().decode('utf-8')
+        except UnicodeDecodeError:
+            file.seek(0)
+            content = file.read().decode('cp949', errors='ignore')
+            
+        lines = content.splitlines()
+        
+        # 데이터 시작 라인 찾기
+        data_start_idx = 0
+        is_data_found = False
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line: continue
+            parts = re.split(r'[,\t\s]+', line)
+            parts = [p for p in parts if p] 
+            
+            if len(parts) >= 2:
+                try:
+                    float(parts[0])
+                    float(parts[1])
+                    data_start_idx = i
+                    is_data_found = True
+                    break
+                except ValueError:
+                    continue
+        
+        if not is_data_found:
+            return None
+            
+        from io import StringIO
+        data_str = "\n".join(lines[data_start_idx:])
+        df = pd.read_csv(StringIO(data_str), sep=None, engine='python', header=None)
+
+        if df.shape[1] < 2:
+            return None
+
+        x = pd.to_numeric(df.iloc[:, 0], errors='coerce').dropna()
+        y = pd.to_numeric(df.iloc[:, 1], errors='coerce').dropna()
+        
+        common_idx = x.index.intersection(y.index)
+        x = x.loc[common_idx].values
+        y = y.loc[common_idx].values
+
+        features = {}
+        
+        # 1. Max Intensity & Peak Position
+        max_idx = np.argmax(y)
+        max_y = y[max_idx]
+        max_x = x[max_idx] # Peak Position (nm or degree)
+
+        features[f"{data_type}_Peak_Pos"] = max_x
+        features[f"{data_type}_Max_Int"] = max_y
+
+        # [신규 기능] PL 데이터일 경우 Bandgap(eV) 계산
+        # 공식: Energy (eV) = 1240 / Wavelength (nm)
+        if data_type == "PL" and max_x > 0:
+            features[f"{data_type}_Bandgap_eV"] = 1240.0 / max_x
+
+        # 2. FWHM (반치폭)
+        half_max = max_y / 2.0
+        sort_idx = np.argsort(x)
+        x_sorted = x[sort_idx]
+        y_sorted = y[sort_idx]
+        
+        # 피크가 여러 개일 수 있으므로 단순화된 로직 사용 (최대 피크 기준)
+        # 1. 최대값보다 왼쪽/오른쪽 데이터 분리
+        #    (x_sorted에서 max_x의 위치를 찾음)
+        #    Note: searchsorted는 정렬된 배열에서만 작동
+        try:
+            # 실제 max_x와 정확히 일치하는 인덱스가 없을 수 있으므로 가장 가까운 값 찾기
+            max_pos_idx = np.argmin(np.abs(x_sorted - max_x))
+            
+            left_x = x_sorted[:max_pos_idx]
+            left_y = y_sorted[:max_pos_idx]
+            right_x = x_sorted[max_pos_idx:]
+            right_y = y_sorted[max_pos_idx:]
+
+            fwhm = 0
+            if len(left_y) > 0 and len(right_y) > 0:
+                idx_l = np.argmin(np.abs(left_y - half_max))
+                idx_r = np.argmin(np.abs(right_y - half_max))
+                fwhm = right_x[idx_r] - left_x[idx_l]
+            features[f"{data_type}_FWHM"] = fwhm
+        except:
+            features[f"{data_type}_FWHM"] = 0
+
+        # 3. Area
+        area = np.trapz(y, x)
+        features[f"{data_type}_Area"] = area
+
+        return features
+
+    except Exception as e:
+        return None
+
+def extract_features_from_sem(file):
+    """
+    SEM 이미지에서 Grain Size 분석 (OpenCV 활용)
+    """
+    try:
+        file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+        
+        if img is None:
+            return None
+
+        # 전처리
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        cl1 = clahe.apply(img)
+        blurred = cv2.GaussianBlur(cl1, (5, 5), 0)
+
+        # 이진화 및 윤곽선
+        ret, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = np.ones((3,3), np.uint8)
+        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        grain_areas = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > 10: 
+                grain_areas.append(area)
+        
+        features = {}
+        if len(grain_areas) > 0:
+            avg_area = np.mean(grain_areas)
+            avg_diameter = np.sqrt(4 * avg_area / np.pi)
+            
+            features["SEM_Grain_Count"] = len(grain_areas)
+            features["SEM_Avg_Size_px"] = avg_diameter
+        else:
+            features["SEM_Grain_Count"] = 0
+            features["SEM_Avg_Size_px"] = 0
+            
+        return features
+
+    except Exception as e:
+        return None
+
 def clean_column_names(df):
-    """컬럼명 특수문자 제거 (XGBoost 등 호환성 확보)"""
     df.columns = df.columns.str.strip()
     return df
 
 def detect_target_column(df):
-    """타겟 컬럼(PCE) 자동 감지"""
     candidates = [c for c in df.columns if 'PCE' in c.upper()]
     if candidates:
         return candidates[0]
     return df.columns[-1] if not df.empty else None
 
 def preprocess_data(df, target_column):
-    """전처리: 타겟 분리, 결측치 제거, 인코딩, 형변환"""
-    
-    # 1. 타겟값 결측치 제거
     df_cleaned = df.dropna(subset=[target_column]).copy()
-    
-    if len(df_cleaned) == 0:
-        return None, None, None, None
+    if len(df_cleaned) == 0: return None, None, None, None
 
-    # 2. 결과 지표 및 타겟 제거 (Data Leakage 방지)
-    # PCE, Voc, Jsc, FF 등 결과값은 입력 변수(X)에 들어가면 안 됩니다.
     drop_keywords = ['PCE', 'Voc', 'Jsc', 'FF', 'Rs', 'Rsh', 'Scan', 'Sample', 'File', 'Unnamed']
-    
-    # 타겟 컬럼은 무조건 삭제 리스트에 포함
     cols_to_drop = [target_column]
-    
     for col in df_cleaned.columns:
-        if col == target_column: 
-            continue # 이미 추가했으므로 패스
-            
-        # 키워드가 포함된 컬럼 찾아서 추가 (대소문자 무시 체크 권장되나 여기선 단순 포함)
+        if col == target_column: continue
         for kw in drop_keywords:
             if kw in col:
                 cols_to_drop.append(col)
                 break
     
-    # 입력 변수(X)와 타겟(y) 분리
     X_raw = df_cleaned.drop(columns=cols_to_drop, errors='ignore')
     y = df_cleaned[target_column]
     
-    # 3. MLB / One-Hot Encoding
     X_numeric = X_raw.select_dtypes(exclude=['object'])
     X_categorical = X_raw.select_dtypes(include=['object'])
     
     all_processed = [X_numeric]
     for col in X_categorical.columns:
-        # 'A + B' 형태 분리
         binarized = X_categorical[col].fillna('').astype(str).str.get_dummies(sep=' + ')
         binarized = binarized.add_prefix(f"{col}_")
         all_processed.append(binarized)
         
     X_processed = pd.concat(all_processed, axis=1).fillna(0)
-    
-    # 4. 특수문자 제거 (컬럼명)
     X_processed.columns = X_processed.columns.str.replace(r'[^\w\s]', '_', regex=True).str.replace(r'\s+', '_', regex=True)
     
-    # [수정됨] 4-1. 중복 컬럼명 처리 (XGBoost 에러 방지 핵심)
-    # 특수문자 제거 후 이름이 같아진 컬럼들(예: A-B -> A_B, A+B -> A_B)에 접미사 추가
+    # 중복 컬럼 처리
     if X_processed.columns.duplicated().any():
         new_columns = []
         seen = {}
@@ -145,11 +321,9 @@ def preprocess_data(df, target_column):
                 new_columns.append(col)
         X_processed.columns = new_columns
     
-    # 5. [중요] 모든 데이터를 float형으로 강제 변환 (에러 방지)
     try:
         X_processed = X_processed.astype(float)
     except ValueError:
-        # 변환 실패 시 (혹시 모를 문자열 잔재) 강제 변환
         for col in X_processed.columns:
             X_processed[col] = pd.to_numeric(X_processed[col], errors='coerce').fillna(0)
 
@@ -159,302 +333,250 @@ def preprocess_data(df, target_column):
 # 메인 UI
 # -------------------------------------------------------------------
 
-st.title("🧪 Perovskite AI Lab V6")
-st.write("재료 탐색 및 공정 최적화를 위한 지능형 분석 플랫폼")
+st.title("⚗️ Perovskite AI Lab V7.1 (Physics-Informed)")
+st.write("공정-물성 통합 분석 (PL 밴드갭 자동 계산 포함)")
 st.markdown("---")
 
-# 1. 사이드바: 데이터 업로드
+# 사이드바: 메인 데이터 업로드 (항상 표시)
 with st.sidebar:
-    st.header("📂 1. Data Input")
-    uploaded_files = st.file_uploader("CSV/Excel 업로드", type=['csv', 'xlsx'], accept_multiple_files=True)
+    st.header("📂 1. Main Recipe Data")
+    uploaded_files = st.file_uploader("메인 CSV/Excel (Sample ID 필수)", type=['csv', 'xlsx'], accept_multiple_files=True, key="main")
     
     st.markdown("---")
-    
-    # 결과 초기화 버튼
-    if st.button("🔄 결과 초기화 (Reset)"):
+    if st.button("🔄 결과 초기화"):
         st.session_state.analysis_results = None
         st.rerun()
 
-    st.caption("Developed based on recent PV ML studies (Nature Energy, 2024)")
-
+# 메인 로직
 if uploaded_files:
     raw_df = load_data(uploaded_files)
     
     if raw_df is not None:
         raw_df = clean_column_names(raw_df)
-        st.write(f"✅ **{len(raw_df)}**개의 샘플 데이터가 로드되었습니다.")
         
-        with st.expander("데이터 미리보기"):
-            st.dataframe(raw_df.head())
-        
-        st.markdown("---")
-        
-        # ----------------------------------------------------------------
-        # 2. 사용자 설정 (타겟 & 모델 선택)
-        # ----------------------------------------------------------------
-        st.header("⚙️ 2. Analysis Settings")
-        
-        col_set1, col_set2, col_set3 = st.columns(3)
-        
-        # Step 1: 타겟 변수 선택
-        with col_set1:
-            default_target = detect_target_column(raw_df)
-            try:
-                default_idx = list(raw_df.columns).index(default_target) if default_target else 0
-            except:
-                default_idx = 0
-                
-            target_col = st.selectbox(
-                "목표 타겟 (Target Variable)", 
-                options=raw_df.columns, 
-                index=default_idx,
-                help="예측하고자 하는 값 (보통 효율 PCE)"
-            )
+        # --------------------------------------------------------------------
+        # 화면 분할 레이아웃 (50:50)
+        # --------------------------------------------------------------------
+        col_left, col_right = st.columns([1, 1], gap="medium")
 
-        # Step 2: 모델 선택
-        with col_set2:
-            model_options = [
-                "XGBoost (Recommended)",
-                "Random Forest (Robust)",
-                "Gaussian Process (Bayesian Opt.)"
-            ]
-            model_choice = st.selectbox(
-                "사용할 ML 모델", 
-                options=model_options,
-                help="데이터가 적다면 Gaussian Process나 Random Forest를 권장합니다."
-            )
-        
-        # Step 3: 테스트 비율
-        with col_set3:
-            test_ratio = st.slider("테스트 데이터 비율", 0.1, 0.5, 0.2, 0.05)
-
-        # 경고 및 가이드 메시지
-        data_len = len(raw_df)
-        if data_len < 20:
-            st.warning(f"⚠️ 데이터가 **{data_len}개**로 매우 적습니다.")
-            if "XGBoost" in model_choice:
-                st.error("🛑 XGBoost는 데이터가 너무 적을 때(20개 미만) 작동하지 않거나 과적합될 수 있습니다. **Gaussian Process** 또는 **Random Forest**를 선택하세요.")
-            else:
-                st.info("💡 적은 데이터셋(Small Data)에 강한 모델을 선택하셨군요. 분석을 진행합니다.")
-
-        # ----------------------------------------------------------------
-        # 3. 분석 실행 (Session State 저장 로직 적용)
-        # ----------------------------------------------------------------
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # 분석 버튼
-        if st.button("🚀 AI 분석 및 최적화 시작 (Run Analysis)", type="primary"):
+        # ====================================================================
+        # [왼쪽] 추가 데이터 업로드 (테이블 형식)
+        # ====================================================================
+        with col_left:
+            st.subheader("🔬 2. Characterization Data Upload")
+            st.info("샘플별 XRD, PL, TRPL, SEM 데이터를 업로드하세요. (PL 업로드 시 밴드갭 자동 계산)")
             
-            with st.spinner(f"데이터 전처리 및 {model_choice.split()[0]} 최적화 중..."):
+            if 'Sample' in raw_df.columns:
                 try:
-                    # 전처리
-                    X, y, df_clean, X_raw_origin = preprocess_data(raw_df, target_col)
+                    sample_ids = sorted(raw_df['Sample'].unique(), key=lambda x: float(x) if str(x).replace('.','',1).isdigit() else str(x))
+                except:
+                    sample_ids = sorted(raw_df['Sample'].astype(str).unique())
+                
+                # 검색창
+                search_term = st.text_input("🔍 Sample ID 검색", placeholder="샘플 번호 입력...")
+                filtered_samples = sample_ids
+                if search_term:
+                    filtered_samples = [s for s in sample_ids if search_term.lower() in str(s).lower()]
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # 1. 테이블 헤더 (5열)
+                h_c1, h_c2, h_c3, h_c4, h_c5 = st.columns([1, 2, 2, 2, 2])
+                h_c1.markdown("<div class='upload-header'>ID</div>", unsafe_allow_html=True)
+                h_c2.markdown("<div class='upload-header'>XRD</div>", unsafe_allow_html=True)
+                h_c3.markdown("<div class='upload-header'>PL</div>", unsafe_allow_html=True)
+                h_c4.markdown("<div class='upload-header'>TRPL</div>", unsafe_allow_html=True)
+                h_c5.markdown("<div class='upload-header'>SEM</div>", unsafe_allow_html=True)
+                
+                # 2. 테이블 행 반복 생성
+                additional_features_list = []
+                
+                for s_id in filtered_samples:
+                    row_c1, row_c2, row_c3, row_c4, row_c5 = st.columns([1, 2, 2, 2, 2])
                     
-                    if X is None:
-                        st.error("전처리 실패: 타겟 컬럼에 유효한 데이터가 없습니다.")
-                    else:
-                        # 데이터 분할
-                        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_ratio, random_state=42)
-                        
-                        # 모델 초기화 및 학습
-                        model = None
-                        is_tree_model = False
-                        
-                        # -----------------------
-                        # A. XGBoost
-                        # -----------------------
-                        if "XGBoost" in model_choice:
-                            is_tree_model = True
-                            xgb_reg = xgb.XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42)
-                            param_grid = {
-                                'n_estimators': [100, 200] if len(X) < 50 else [100, 300, 500],
-                                'max_depth': [3, 5],
-                                'learning_rate': [0.05, 0.1]
-                            }
-                            search = GridSearchCV(xgb_reg, param_grid, cv=3, scoring='neg_mean_absolute_error', error_score='raise')
-                            search.fit(X_train, y_train)
-                            model = search.best_estimator_
-
-                        # -----------------------
-                        # B. Random Forest
-                        # -----------------------
-                        elif "Random Forest" in model_choice:
-                            is_tree_model = True
-                            rf_reg = RandomForestRegressor(random_state=42, n_jobs=-1)
-                            param_grid = {
-                                'n_estimators': [100, 200],
-                                'max_depth': [None, 10],
-                                'min_samples_leaf': [1, 2]
-                            }
-                            search = GridSearchCV(rf_reg, param_grid, cv=3, scoring='neg_mean_absolute_error')
-                            search.fit(X_train, y_train)
-                            model = search.best_estimator_
-
-                        # -----------------------
-                        # C. Gaussian Process
-                        # -----------------------
-                        elif "Gaussian Process" in model_choice:
-                            # 데이터 스케일링
-                            scaler_X = StandardScaler()
-                            X_train_scaled = scaler_X.fit_transform(X_train)
-                            X_test_scaled = scaler_X.transform(X_test)
-                            
-                            kernel = 1.0 * RBF(length_scale=1.0) + WhiteKernel(noise_level=1.0)
-                            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, random_state=42)
-                            gp.fit(X_train_scaled, y_train)
-                            model = gp
-                            
-                            # GP용 커스텀 predict 함수 저장
-                            model.custom_predict = lambda X_in: gp.predict(scaler_X.transform(X_in), return_std=False)
-                            model.custom_predict_std = lambda X_in: gp.predict(scaler_X.transform(X_in), return_std=True)
-
-                        # 예측 및 평가
-                        if "Gaussian Process" in model_choice:
-                            y_pred, y_std = model.custom_predict_std(X_test)
-                        else:
-                            y_pred = model.predict(X_test)
-                            y_std = None
-                        
-                        r2 = r2_score(y_test, y_pred)
-                        mae = mean_absolute_error(y_test, y_pred)
-
-                        # 결과 세션 저장
-                        st.session_state.analysis_results = {
-                            "model_choice": model_choice,
-                            "r2": r2,
-                            "mae": mae,
-                            "y_test": y_test,
-                            "y_pred": y_pred,
-                            "y_std": y_std,
-                            "target_col": target_col,
-                            "model": model,
-                            "X_train": X_train,
-                            "X_test": X_test,
-                            "X": X,
-                            "y": y,
-                            "X_raw_origin": X_raw_origin,
-                            "df_clean": df_clean,
-                            "is_tree_model": is_tree_model
-                        }
-                        
-                except Exception as e:
-                    st.error(f"모델 학습 중 오류 발생: {e}")
-                    st.write(f"상세 에러: {str(e)}")
-
-        # ----------------------------------------------------------------
-        # 4. 결과 리포트 (저장된 세션 데이터로 표시)
-        # ----------------------------------------------------------------
-        if st.session_state.analysis_results is not None:
-            res = st.session_state.analysis_results
-            
-            st.success("✅ 분석 완료!")
-            
-            # Tab 구성
-            tab1, tab2, tab3 = st.tabs(["📊 성능 평가", "🔍 중요도 분석 (XAI)", "💡 최적화 제안"])
-            
-            with tab1:
-                c1, c2 = st.columns(2)
-                c1.metric("R² Score (정확도)", f"{res['r2']:.4f}")
-                c2.metric("MAE (평균 오차)", f"{res['mae']:.4f}")
+                    with row_c1:
+                        st.markdown(f"<div class='sample-id-cell'>{s_id}</div>", unsafe_allow_html=True)
+                    
+                    f_xrd = row_c2.file_uploader("XRD", key=f"xrd_{s_id}", type=['csv', 'txt', 'dat'], label_visibility="collapsed")
+                    f_pl = row_c3.file_uploader("PL", key=f"pl_{s_id}", type=['csv', 'txt', 'dat'], label_visibility="collapsed")
+                    f_trpl = row_c4.file_uploader("TRPL", key=f"trpl_{s_id}", type=['csv', 'txt', 'dat'], label_visibility="collapsed")
+                    f_sem = row_c5.file_uploader("SEM", key=f"sem_{s_id}", type=['jpg', 'jpeg', 'png', 'tif', 'tiff'], label_visibility="collapsed")
+                    
+                    current_feats = {'Sample': s_id}
+                    
+                    if f_xrd:
+                        feats = extract_features_from_spectra(f_xrd, "XRD")
+                        if feats: current_feats.update(feats)
+                    if f_pl:
+                        feats = extract_features_from_spectra(f_pl, "PL")
+                        if feats: current_feats.update(feats)
+                    if f_trpl:
+                        feats = extract_features_from_spectra(f_trpl, "TRPL")
+                        if feats: current_feats.update(feats)
+                    if f_sem:
+                        feats = extract_features_from_sem(f_sem)
+                        if feats: current_feats.update(feats)
+                    
+                    if len(current_feats) > 1:
+                        additional_features_list.append(current_feats)
                 
-                fig, ax = plt.subplots(figsize=(6, 5))
-                ax.scatter(res['y_test'], res['y_pred'], alpha=0.7, edgecolors='k', label='Data')
-                ax.plot([res['y'].min(), res['y'].max()], [res['y'].min(), res['y'].max()], 'r--', lw=2, label='Ideal')
-                if res['y_std'] is not None:
-                    ax.errorbar(res['y_test'], res['y_pred'], yerr=res['y_std'], fmt='none', alpha=0.2, ecolor='gray', label='Uncertainty')
-                
-                ax.set_xlabel(f"Actual {res['target_col']}")
-                ax.set_ylabel(f"Predicted {res['target_col']}")
-                ax.set_title(f"{res['model_choice'].split()[0]} Regression Result")
-                ax.legend()
-                st.pyplot(fig)
-
-            with tab2:
-                st.subheader("Feature Analysis")
-                importances = None
-                
-                if res['is_tree_model']:
-                    st.write("**SHAP (SHapley Additive exPlanations)** 분석 결과")
+                # 병합 로직
+                if additional_features_list:
+                    add_df = pd.DataFrame(additional_features_list)
                     try:
-                        explainer = shap.Explainer(res['model'], res['X_train'])
-                        shap_values = explainer(res['X_test'])
-                        
-                        fig_shap, ax_shap = plt.subplots()
-                        shap.summary_plot(shap_values, res['X_test'], show=False)
-                        st.pyplot(fig_shap)
-                        
-                        # 중요도 추출
-                        importances = np.abs(shap_values.values).mean(axis=0)
-                    except Exception as e:
-                        st.warning(f"SHAP 계산 중 경고: {e}")
-                        # Fallback to feature importances
-                        importances = res['model'].feature_importances_
-                else:
-                    st.info("Gaussian Process는 SHAP 대신 상관계수(Correlation)를 기반으로 중요도를 추정합니다.")
+                        raw_df['Sample'] = raw_df['Sample'].astype(int)
+                        add_df['Sample'] = add_df['Sample'].astype(int)
+                    except:
+                        raw_df['Sample'] = raw_df['Sample'].astype(str)
+                        add_df['Sample'] = add_df['Sample'].astype(str)
                     
-                    # 상관계수 계산
-                    corr_df = res['X'].copy()
-                    corr_df['Target'] = res['y'].values
-                    
-                    corr_matrix = corr_df.corr()
-                    target_corr = corr_matrix[['Target']].sort_values(by='Target', key=abs, ascending=False).drop('Target').head(10)
-                    
-                    st.dataframe(target_corr.style.background_gradient(cmap='coolwarm'))
-                    
-                    # 중요도 배열
-                    full_target_corr = corr_matrix['Target'].drop('Target')
-                    importances = np.abs(full_target_corr.reindex(res['X'].columns).fillna(0).values)
+                    raw_df = pd.merge(raw_df, add_df, on='Sample', how='left')
+                    st.success(f"✅ 총 {len(additional_features_list)}개 샘플의 외부 데이터 병합 완료")
 
-            with tab3:
-                st.subheader("실험 조건 최적화 제안")
-                best_idx = res['y'].idxmax()
-                st.success(f"현재 최고 성능: **{res['y'].max():.4f}** (Sample ID: {best_idx})")
-                
-                # 중요 변수 Top 5
-                feat_imp_df = pd.DataFrame({'Feature': res['X'].columns, 'Imp': list(importances)})
-                top_feats = feat_imp_df.sort_values('Imp', ascending=False).head(5)['Feature'].tolist()
-                
-                best_recipe = res['df_clean'].loc[best_idx]
-                suggestions = []
-                for feat in top_feats:
-                    # 원본 컬럼 찾기
-                    orig = feat
-                    for raw_c in res['X_raw_origin'].columns:
-                        if re.sub(r'[^\w]', '_', str(raw_c)) in feat:
-                            orig = raw_c
-                            break
-                    
-                    val = best_recipe.get(orig, best_recipe.get(feat, "N/A"))
-                    
-                    # --- [추가 기능] 연관 상세 조건(Context) 자동 탐색 ---
-                    parts = str(orig).split('_')
-                    if len(parts) >= 2:
-                        prefix_group = "_".join(parts[:2])
-                    else:
-                        prefix_group = parts[0]
-                    
-                    context_list = []
-                    for col_name in best_recipe.index:
-                        if col_name == orig: continue
-                        if str(col_name).startswith(prefix_group):
-                            detail_val = best_recipe[col_name]
-                            if pd.notna(detail_val) and str(detail_val).strip() != '':
-                                short_name = str(col_name).replace(prefix_group, '').strip('_')
-                                context_list.append(f"{short_name}: {detail_val}")
-                    
-                    context_str = " | ".join(context_list) if context_list else "-"
-                    
-                    suggestions.append({
-                        "중요 변수": feat,
-                        "현재 최고값": val,
-                        "세부 공정 조건 (Context)": context_str,
-                        "제안": "이 변수의 주변 값을 탐색(Exploration) 하세요."
-                    })
-                
-                st.table(pd.DataFrame(suggestions))
+            else:
+                st.error("메인 데이터에 'Sample' 컬럼이 없어 테이블을 생성할 수 없습니다.")
+
+        # ====================================================================
+        # [오른쪽] 분석 설정 및 결과
+        # ====================================================================
+        with col_right:
+            st.subheader("⚙️ Analysis & Results")
+            st.write(f"✅ 총 **{len(raw_df)}**개 샘플 데이터 준비됨")
             
-            # 하단 여백 추가
-            st.markdown('<div class="bottom-spacer"></div>', unsafe_allow_html=True)
+            # 외부 변수 확인
+            ext_cols = [c for c in raw_df.columns if c.startswith(('XRD_', 'PL_', 'TRPL_', 'SEM_'))]
+            if ext_cols:
+                st.caption(f"✨ 추출된 변수: {', '.join(ext_cols)}")
+            
+            # 밴드갭 계산 확인 메시지
+            if 'PL_Bandgap_eV' in raw_df.columns:
+                st.info("💡 **Physics-Informed:** PL 데이터를 기반으로 **Bandgap (eV)**이 자동 계산되었습니다!")
 
+            with st.expander("통합 데이터 미리보기", expanded=False):
+                st.dataframe(raw_df.head())
+            
+            st.markdown("---")
+
+            # 분석 설정 UI
+            lc1, lc2, lc3 = st.columns(3)
+            with lc1:
+                target_col = st.selectbox("타겟 변수", options=raw_df.columns, index=list(raw_df.columns).index(detect_target_column(raw_df)) if detect_target_column(raw_df) else 0)
+            with lc2:
+                model_choice = st.selectbox("ML 모델", ["XGBoost (Recommended)", "Random Forest", "Gaussian Process"])
+            with lc3:
+                test_ratio = st.slider("테스트 비율", 0.1, 0.5, 0.2)
+
+            # 분석 실행 버튼
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🚀 AI 분석 시작", type="primary", use_container_width=True):
+                with st.spinner(f"{model_choice} 최적화 모델 구동 중..."):
+                    try:
+                        X, y, df_clean, X_raw_origin = preprocess_data(raw_df, target_col)
+                        
+                        if X is None:
+                            st.error("데이터 전처리 실패")
+                        else:
+                            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_ratio, random_state=42)
+                            
+                            model = None
+                            is_tree_model = False
+                            
+                            if "XGBoost" in model_choice:
+                                is_tree_model = True
+                                xgb_reg = xgb.XGBRegressor(objective='reg:squarederror', n_jobs=-1, random_state=42)
+                                search = GridSearchCV(xgb_reg, {'n_estimators':[100,200], 'max_depth':[3,5], 'learning_rate':[0.05,0.1]}, cv=3, scoring='neg_mean_absolute_error', error_score='raise')
+                                search.fit(X_train, y_train)
+                                model = search.best_estimator_
+                            elif "Random Forest" in model_choice:
+                                is_tree_model = True
+                                rf_reg = RandomForestRegressor(random_state=42, n_jobs=-1)
+                                search = GridSearchCV(rf_reg, {'n_estimators':[100,200], 'max_depth':[10,None]}, cv=3, scoring='neg_mean_absolute_error')
+                                search.fit(X_train, y_train)
+                                model = search.best_estimator_
+                            elif "Gaussian Process" in model_choice:
+                                scaler_X = StandardScaler()
+                                X_train_scaled = scaler_X.fit_transform(X_train)
+                                X_test_scaled = scaler_X.transform(X_test)
+                                kernel = 1.0 * RBF(1.0) + WhiteKernel(1.0)
+                                gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, random_state=42)
+                                gp.fit(X_train_scaled, y_train)
+                                model = gp
+                                model.custom_predict_std = lambda X_in: gp.predict(scaler_X.transform(X_in), return_std=True)
+
+                            if "Gaussian Process" in model_choice:
+                                y_pred, y_std = model.custom_predict_std(X_test)
+                            else:
+                                y_pred = model.predict(X_test)
+                                y_std = None
+                                
+                            st.session_state.analysis_results = {
+                                "model": model, "r2": r2_score(y_test, y_pred), "mae": mean_absolute_error(y_test, y_pred),
+                                "y_test": y_test, "y_pred": y_pred, "y_std": y_std, "X_test": X_test, "X_train": X_train,
+                                "X": X, "y": y, "target_col": target_col, "df_clean": df_clean,
+                                "X_raw_origin": X_raw_origin, "model_choice": model_choice, "is_tree_model": is_tree_model
+                            }
+                    except Exception as e:
+                        st.error(f"분석 중 오류 발생: {e}")
+
+            # 결과 리포트
+            if st.session_state.analysis_results:
+                res = st.session_state.analysis_results
+                st.markdown("---")
+                
+                t1, t2, t3 = st.tabs(["📊 성능 평가", "🔍 중요도 분석", "💡 최적화 제안"])
+                
+                with t1:
+                    col1, col2 = st.columns(2)
+                    col1.metric("결정계수 (R²)", f"{res['r2']:.4f}")
+                    col2.metric("오차 (MAE)", f"{res['mae']:.4f}")
+                    fig, ax = plt.subplots(figsize=(6,5))
+                    ax.scatter(res['y_test'], res['y_pred'], alpha=0.7, edgecolors='k')
+                    ax.plot([res['y'].min(), res['y'].max()], [res['y'].min(), res['y'].max()], 'r--', lw=2)
+                    ax.set_xlabel("Actual"); ax.set_ylabel("Predicted")
+                    st.pyplot(fig)
+
+                with t2:
+                    importances = None
+                    if res['is_tree_model']:
+                        try:
+                            explainer = shap.Explainer(res['model'], res['X_train'])
+                            shap_values = explainer(res['X_test'])
+                            fig, ax = plt.subplots()
+                            shap.summary_plot(shap_values, res['X_test'], show=False)
+                            st.pyplot(fig)
+                            importances = np.abs(shap_values.values).mean(axis=0)
+                        except:
+                            importances = res['model'].feature_importances_
+                    else:
+                        full_corr = res['X'].copy()
+                        full_corr['Target'] = res['y'].values
+                        importances = np.abs(full_corr.corr()['Target'].drop('Target').values)
+                    
+                with t3:
+                    best_idx = res['y'].idxmax()
+                    st.info(f"🏆 Best Sample: **ID {best_idx}** ({res['y'].max():.2f})")
+                    
+                    feat_imp_df = pd.DataFrame({'Feature': res['X'].columns, 'Imp': list(importances)})
+                    top_feats = feat_imp_df.sort_values('Imp', ascending=False).head(5)['Feature'].tolist()
+                    
+                    best_recipe = res['df_clean'].loc[best_idx]
+                    suggestions = []
+                    for feat in top_feats:
+                        orig = feat
+                        for raw_c in res['X_raw_origin'].columns:
+                            if re.sub(r'[^\w]', '_', str(raw_c)) in feat:
+                                orig = raw_c
+                                break
+                        val = best_recipe.get(orig, "N/A")
+                        
+                        # Context
+                        parts = str(orig).split('_')
+                        prefix = "_".join(parts[:2]) if len(parts)>=2 else parts[0]
+                        ctx = [f"{c.replace(prefix,'').strip('_')}:{best_recipe[c]}" for c in best_recipe.index if c!=orig and str(c).startswith(prefix) and pd.notna(best_recipe[c])]
+                        
+                        suggestions.append({"순위": top_feats.index(feat)+1, "중요 변수": feat, "최고 효율 조건": val, "세부 조건": " | ".join(ctx) if ctx else "-"})
+                    st.table(pd.DataFrame(suggestions))
+                
+                st.markdown('<div class="bottom-spacer"></div>', unsafe_allow_html=True)
 else:
-    st.info("👈 왼쪽 사이드바에서 데이터 파일을 업로드해주세요.")
+    st.info("👈 왼쪽 사이드바에서 메인 데이터 파일을 업로드하세요.")
